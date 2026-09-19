@@ -16,7 +16,7 @@ from sklearn.metrics import classification_report, confusion_matrix
 
 
 class QueryClassifier:
-    def __init__(self, model_path="bert_query_classifier"):
+    def __init__(self, model_path=r"F:\small_project\aiagent\ailearn\rag\Itcast_qa_system\rag_qa\models\bert_classification_output"):
         # 初始化模型路径
         self.model_path = model_path
         # 加载 BERT 分词器
@@ -32,7 +32,7 @@ class QueryClassifier:
         # 记录设备信息
         logger.info(f"使用设备: {self.device}")
         # 定义标签映射
-        self.label_map = {"通用知识": 0, "专业咨询": 1}
+        self.label_map = {"通用无关": 0, "股票财经": 1}
         # 加载模型
         self.load_model()
 
@@ -188,8 +188,8 @@ class QueryClassifier:
         if self.model is None:
             # 模型未加载，记录错误
             logger.error("模型未训练或加载")
-            # 默认返回通用知识
-            return "通用知识"
+            # 默认返回通用无关
+            return "通用无关"
         # 对查询进行编码
         encoding = self.tokenizer(query, truncation=True, padding=True, max_length=128, return_tensors="pt")
         # 将编码移到指定设备
@@ -202,22 +202,4 @@ class QueryClassifier:
             # 获取预测结果
             prediction = torch.argmax(outputs.logits, dim=1).item()
         # 根据预测结果返回类别
-        return "专业咨询" if prediction == 1 else "通用知识"
-
-
-if __name__ == "__main__":
-    # 初始化分类器
-    classifier = QueryClassifier(model_path="/Users/chan/projects/models/bert-base-chinese")  # 可以修改自己的bert模型路径
-
-    # 训练模型
-    classifier.train_model(data_file='../classify_data/chatgpt_generate_200.jsonl')  # 可以修改自己的训练数据路径
-    # 示例预测
-    test_queries = [
-        "AI学科的课程大纲是什么",
-        "JAVA课程费用多少？",
-        "5*9等于多少？",
-        "AI培训有哪些老师？"
-    ]
-    for query in test_queries:
-        category = classifier.predict_category(query)
-        print(f"查询: {query} -> 分类: {category}")
+        return "股票财经" if prediction == 1 else "通用无关"

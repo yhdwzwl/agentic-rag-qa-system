@@ -1,7 +1,5 @@
-# 导入 MongoDB 客户端
-from db.mongo_client import MongoDBClient
-# 导入 Redis 客户端
-from cache.redis_client import RedisClient
+# 导入 MySQL 客户端
+from db.mysql_client import MySQLClient
 # 导入 BM25 搜索
 from retrieval.bm25_search import BM25Search
 # 导入日志
@@ -10,16 +8,14 @@ from base import logger
 import time
 
 
-class MongoDBQASystem:
-    def __init__(self, bm25_threshold:float=0.85):
+class MySQLQASystem:
+    def __init__(self, bm25_threshold:float=0.9):
         # 初始化日志
         self.logger = logger
         # 初始化 MySQL 客户端
-        self.mongo_client = MongoDBClient()
-        # 初始化 Redis 客户端
-        self.redis_client = RedisClient()  # 确保Redis也被纳入生命周期管理
-        # 初始化 BM25 搜索
-        self.bm25_search = BM25Search(self.redis_client, self.mongo_client) # 初始化BM25搜索 缓存 + 持久化
+        self.mysql_client = MySQLClient()
+        # 初始化 BM25 搜索（纯内存，无Redis）
+        self.bm25_search = BM25Search(self.mysql_client)
         self.bm25_threshold = bm25_threshold    # 阈值配置化
 
     def query(self, query: str) -> str:
@@ -32,7 +28,7 @@ class MongoDBQASystem:
         processing_time = time.time() - start_time
         self.logger.info(f"查询完成 | 耗时: {processing_time:.3f}s | 状态: {status}")
 
-        if status in ("cache_hit", "bm25_hit"):
+        if status == "bm25_hit":
             return answer
 
         # fallback / invalid / error 均走 RAG 兜底
@@ -43,18 +39,17 @@ class MongoDBQASystem:
     def close(self):
         """统一资源释放入口"""
         try:
-            self.mongo_client.close()
-            self.redis_client.close()  # 补全Redis连接关闭
-            self.logger.info("数据库与缓存连接已安全关闭")
+            self.mysql_client.close()
+            self.logger.info("数据库连接已安全关闭")
         except Exception as e:
             self.logger.error(f"关闭连接时发生错误: {e}")
 
 def main():
-    # 初始化 MongoDB 系统
-    Mongo_system = MongoDBQASystem()
+    # 初始化 MySQL 问答系统
+    system = MySQLQASystem()
     try:
         # 打印欢迎信息
-        print("\n欢迎使用 MongoDB 问答系统！")
+        print("\n欢迎使用 MySQL 标准问答缓存系统！")
         print("输入查询进行问答，输入 'exit' 退出。")
         while True:
             # 获取用户输入
@@ -66,7 +61,7 @@ def main():
                 print("再见！")
                 break
             # 执行查询
-            answer = Mongo_system.query(query)
+            answer = system.query(query)
             # 打印答案
             print(f"\n答案: {answer}")
     except Exception as e:
@@ -75,8 +70,8 @@ def main():
         # 打印错误信息
         print(f"发生错误: {e}")
     finally:
-        # 关闭  连接
-        Mongo_system.close()
+        # 关闭连接
+        system.close()
 
 
 if __name__ == "__main__":

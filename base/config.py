@@ -30,9 +30,18 @@ class Config:
         # Redis 端口
         self.REDIS_PORT = self.config.getint('redis', 'port', fallback=6379)
         # Redis 密码
-        self.REDIS_PASSWORD = self.config.get('redis', 'password', fallback='1234')
+        self.REDIS_PASSWORD = self.config.get('redis', 'password', fallback='')
         # Redis 数据库编号
         self.REDIS_DB = self.config.getint('redis', 'db', fallback=0)
+
+        # Redis 向量缓存配置
+        self.REDIS_VECTOR_CACHE_INDEX = self.config.get('redis_vector_cache', 'index_name', fallback='rag_query_vector_cache')
+        self.REDIS_VECTOR_CACHE_DIM = self.config.getint('redis_vector_cache', 'vector_dim', fallback=768)
+        self.REDIS_VECTOR_CACHE_SIMILARITY_THRESHOLD = self.config.getfloat('redis_vector_cache', 'similarity_threshold', fallback=0.95)
+        self.REDIS_VECTOR_CACHE_TEMPORARY_TTL = self.config.getint('redis_vector_cache', 'temporary_ttl', fallback=86400)
+        self.REDIS_VECTOR_CACHE_FORMAL_TTL = self.config.getint('redis_vector_cache', 'formal_ttl', fallback=604800)
+        self.REDIS_VECTOR_CACHE_HOT_THRESHOLD = self.config.getint('redis_vector_cache', 'hot_threshold', fallback=3)
+        self.REDIS_VECTOR_CACHE_MAX_SIZE = self.config.getint('redis_vector_cache', 'max_cache_size', fallback=100000)
 
         # Milvus 配置
         # Milvus 主机地址

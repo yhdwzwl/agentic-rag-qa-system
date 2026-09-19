@@ -9,13 +9,11 @@ from base import logger
 
 
 class BM25Search:
-    def __init__(self, redis_client, mongo_client):
+    def __init__(self, mysql_client):
         # 初始化日志
         self.logger = logger
-        # 初始化 Redis 客户端
-        self.redis_client = redis_client
-        # 初始化 Mongo 客户端
-        self.mongo_client = mongo_client
+        # 初始化 MySQL 客户端
+        self.mysql_client = mysql_client
         # 初始化 BM25 模型
         self.bm25 = None
         # 初始化问题列表
@@ -26,36 +24,17 @@ class BM25Search:
         self._load_data()
 
     def _load_data(self):
-        # 加载数据 redis key
-        original_key = "qa_original_questions"
-        tokenized_key = "qa_tokenized_questions"
-        # 从 Redis 获取原始问题
-        self.original_questions = self.redis_client.get_data(original_key)
-        # 从 Redis 获取分词问题
-        tokenized_questions = self.redis_client.get_data(tokenized_key)
-        # 如果 Redis 中没有数据，从 Mongo 加载
-        if not self.original_questions or not tokenized_questions:
-            # 从 Mongo 获取问题
-            self.original_questions = self.mongo_client.fetch_questions()
-            if not self.original_questions:
-                # 记录无问题警告
-                self.logger.warning("未加载到问题")
-                return
-            # 分词问题
-            for q in self.original_questions:
-                preprocess_text(q)
-
-            tokenized_questions = [preprocess_text(q) for q in self.original_questions]
-            # 存储原始问题到 Redis
-            self.redis_client.set_data(original_key, [(q) for q in self.original_questions])
-            # 存储分词问题到 Redis
-            self.redis_client.set_data(tokenized_key, tokenized_questions)
-        # 设置问题列表
-        self.questions = tokenized_questions
+        # 从 MySQL 获取所有标准问答对
+        qa_pairs = self.mysql_client.get_all_qa_pairs()
+        if not qa_pairs:
+            self.logger.warning("未加载到标准问答对")
+            return
+        self.original_questions = [pair['question'] for pair in qa_pairs]
+        # 分词
+        self.questions = [preprocess_text(q) for q in self.original_questions]
         # 初始化 BM25 模型
         self.bm25 = BM25Okapi(self.questions)
-        # 记录 BM25 初始化成功
-        self.logger.info("BM25 模型初始化完成")
+        self.logger.info(f"BM25 模型初始化完成, 共 {len(self.questions)} 个标准问题")
 
     def search(self, query: str, threshold: float = 0.85) -> tuple[str | None, str]:
         """
@@ -74,44 +53,26 @@ class BM25Search:
             self.logger.error(f"无效查询: {query}")
             return None, "invalid"
 
-        # 2. L1: Redis 缓存拦截
-        cached_answer = self.redis_client.get_answer(query)
-        if cached_answer:
-            self.logger.info(f"Redis缓存命中 | Query: '{query}'")
-            return cached_answer, "cache_hit"
-
         try:
-            # 3. L2: BM25 检索与打分
+            # 2. BM25 检索与打分
             query_tokens = preprocess_text(query)
             scores = self.bm25.get_scores(query_tokens)
             softmax_scores = self._softmax(scores)
-            # 【优化】使用 Min-Max 归一化替代 Softmax，避免分数过度平滑
-            # min_score, max_score = scores.min(), scores.max()
-            # if max_score == min_score:
-            #     normalized_scores = np.zeros_like(scores)
-            # else:
-            #     normalized_scores = (scores - min_score) / (max_score - min_score)
             best_idx = softmax_scores.argmax()
-            # 获取最高分
             best_score = softmax_scores[best_idx]
-            # best_idx = normalized_scores.argmax()
-            # best_score = normalized_scores[best_idx]
 
             self.logger.debug(f"BM25最高归一化分数: {best_score:.3f} | 候选: {self.original_questions[best_idx]}")
 
-            # 4. 阈值判断与持久层查询
+            # 3. 阈值判断
             if best_score >= threshold:
                 original_question = self.original_questions[best_idx]
-                # 【修正】统一使用 mongo_client
-                answer = self.mongo_client.fetch_answer(original_question)
+                answer = self.mysql_client.get_answer_by_question(original_question)
 
                 if answer:
-                    # 异步/后台缓存，不阻塞当前响应（可选优化）
-                    self.redis_client.set_data(f"answer:{query}", answer)
                     self.logger.info(f"BM25检索成功 | Score: {best_score:.3f} | Query: '{query}'")
                     return answer, "bm25_hit"
 
-            # 5. 未达标，返回 Fallback 信号
+            # 4. 未达标，返回 Fallback 信号
             self.logger.info(f"BM25未达阈值 | Score: {best_score:.3f} < {threshold} | 需触发RAG")
             return None, "fallback"
         except Exception as e:

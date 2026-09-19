@@ -23,9 +23,31 @@ class MySQLClient:
             )
             self.cursor = self.connection.cursor(pymysql.cursors.DictCursor)
             self.logger.info(f"MySQL 连接成功: {conf.MYSQL_HOST}:{conf.MYSQL_PORT}/{conf.MYSQL_DATABASE}")
+            # 自动建表
+            self._create_tables_if_not_exists()
         except pymysql.MySQLError as e:
             self.logger.error(f"MySQL 连接失败: {e}")
             raise
+
+    def _create_tables_if_not_exists(self):
+        """自动创建所有需要的表（如果不存在）"""
+        # standard_qa 标准问答对表
+        self.cursor.execute("""
+            CREATE TABLE IF NOT EXISTS standard_qa (
+                id INT AUTO_INCREMENT PRIMARY KEY COMMENT '主键',
+                question TEXT NOT NULL COMMENT '标准问题',
+                answer TEXT NOT NULL COMMENT '标准答案',
+                category VARCHAR(100) COMMENT '分类：重大事项/风险提示/融资公告/持股变动/信息变更/通用',
+                status VARCHAR(20) DEFAULT 'active' COMMENT '状态：active/inactive',
+                hit_count INT DEFAULT 0 COMMENT '命中次数',
+                created_time DATETIME DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间',
+                updated_time DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP COMMENT '更新时间',
+                INDEX idx_category (category),
+                INDEX idx_status (status)
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='标准问答对表（人工校对）'
+        """)
+        self.connection.commit()
+        self.logger.info("MySQL 表结构检查完成")
 
     # ==================== parent_docs（父文档表） ====================
     def insert_parent_doc(self, file_id: int = None, file_name: str = None,
@@ -203,6 +225,30 @@ class MySQLClient:
         sql = f"UPDATE pdf_files SET {', '.join(fields)} WHERE id = %s"
         self.cursor.execute(sql, params)
         self.connection.commit()
+
+    # ==================== standard_qa（标准问答对表） ====================
+    def get_all_qa_pairs(self) -> List[Dict]:
+        """获取所有标准问答对，用于BM25初始化"""
+        sql = "SELECT id, question, answer, category FROM standard_qa WHERE status = 'active'"
+        self.cursor.execute(sql)
+        return self.cursor.fetchall()
+
+    def insert_qa_pair(self, question: str, answer: str,
+                       category: str = None, status: str = 'active') -> int:
+        """插入标准问答对"""
+        sql = """INSERT INTO standard_qa
+                 (question, answer, category, status, created_time, updated_time)
+                 VALUES (%s, %s, %s, %s, NOW(), NOW())"""
+        self.cursor.execute(sql, (question, answer, category, status))
+        self.connection.commit()
+        return self.cursor.lastrowid
+
+    def get_answer_by_question(self, question: str) -> Optional[str]:
+        """根据问题获取答案"""
+        sql = "SELECT answer FROM standard_qa WHERE question = %s AND status = 'active'"
+        self.cursor.execute(sql, (question,))
+        row = self.cursor.fetchone()
+        return row['answer'] if row else None
 
     # ==================== 工具方法 ====================
     def close(self):
