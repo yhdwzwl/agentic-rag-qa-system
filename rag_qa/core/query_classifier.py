@@ -29,8 +29,6 @@ class QueryClassifier:
             "mps" if torch.backends.mps.is_available() else
             "cpu"
         )
-        # self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        # self.device = 'mps'
         # 记录设备信息
         logger.info(f"使用设备: {self.device}")
         # 定义标签映射
@@ -171,8 +169,6 @@ class QueryClassifier:
             return_tensors="pt"
         )
         dataset = self.create_dataset(encodings, labels)
-        # output = model(**inputs, label)
-        # loss = output.loss eval_loss
         trainer = Trainer(model=self.model)
         predictions = trainer.predict(dataset)
         pred_labels = np.argmax(predictions.predictions, axis=-1)

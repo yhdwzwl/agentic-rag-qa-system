@@ -13,8 +13,13 @@ class Config:
         self.config.read(config_file, encoding='utf-8')  # windows包gbk错误，增加encoding=utf-8
 
         # MySQL 配置
-        # MySQL 主机地址
-        # 获取section 是mysql host变量失败返回localhost
+        self.MYSQL_HOST = self.config.get('mysql', 'host', fallback='localhost')
+        self.MYSQL_PORT = self.config.getint('mysql', 'port', fallback=3306)
+        self.MYSQL_USER = self.config.get('mysql', 'user', fallback='root')
+        self.MYSQL_PASSWORD = self.config.get('mysql', 'password', fallback='')
+        self.MYSQL_DATABASE = self.config.get('mysql', 'database', fallback='')
+
+        # MongoDB 配置
         self.MONGO_URL = self.config.get('mongodb', 'mongo_url', fallback='localhost')
         self.MONGO_USER = self.config.get('mongodb', 'user', fallback='root')
         self.MONGO_DB = self.config.get('mongodb', 'mongo_db_name', fallback='subjects_kg')

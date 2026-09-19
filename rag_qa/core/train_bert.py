@@ -24,7 +24,7 @@ from transformers import (
 from datasets import load_dataset
 
 # 配置标签映射 (根据需求固定)
-LABEL_MAP = {"通用知识": 0, "专业咨询": 1}
+LABEL_MAP = {"通用无关": 0, "股票财经": 1}
 ID2LABEL = {v: k for k, v in LABEL_MAP.items()}
 NUM_LABELS = len(LABEL_MAP)
 
@@ -56,10 +56,10 @@ class BERTClassifier:
 
     def _preprocess_function(self, examples):
         """数据集预处理函数"""
-        # 将字符串标签转换为 ID
-        labels = [self.label_map[label] for label in examples["label"]]
+        # 标签是数字0/1，直接用
+        labels = examples["label"]
         tokenized = self.tokenizer(
-            examples["query"],
+            examples["text"],
             truncation=True,
             padding=True,
             max_length=128
@@ -83,24 +83,38 @@ class BERTClassifier:
 
         # 映射标签以验证数据合法性
         def check_label(example):
-            if example['label'] not in self.label_map:
-                raise ValueError(f"Unknown label: {example['label']}. Allowed: {list(self.label_map.keys())}")
+            if example['label'] not in [0, 1]:
+                raise ValueError(f"Unknown label: {example['label']}. Allowed: [0, 1]")
             return example
 
         raw_dataset = raw_dataset.map(check_label)
         return raw_dataset
 
-    def train(self, train_file: str, eval_file: str, args: TrainingArguments = None):
+    def load_data_from_mongo(self, db_name: str = "rag_doc_data", collection: str = "bert_2_data"):
+        """直接从MongoDB加载数据"""
+        from pymongo import MongoClient
+        from datasets import Dataset
+
+        client = MongoClient("mongodb://localhost:27017/")
+        col = client[db_name][collection]
+
+        # 查所有数据
+        docs = list(col.find({}, {"_id": 0, "text": 1, "label": 1}))
+        client.close()
+
+        print(f"从MongoDB加载了 {len(docs)} 条数据")
+
+        # 转成Dataset
+        dataset = Dataset.from_list(docs)
+        return dataset
+
+    def train(self, train_dataset, eval_dataset, args: TrainingArguments = None):
         """
         训练模型
-        :param train_file: 训练集路径
-        :param eval_file: 验证集路径
+        :param train_dataset: 训练集Dataset对象
+        :param eval_dataset: 验证集Dataset对象
         :param args: TrainingArguments 配置
         """
-        print("Loading datasets...")
-        train_dataset = self.load_data(train_file)
-        eval_dataset = self.load_data(eval_file)
-
         print("Tokenizing datasets...")
         train_dataset = train_dataset.map(self._preprocess_function, batched=True)
         eval_dataset = eval_dataset.map(self._preprocess_function, batched=True)
@@ -258,22 +272,27 @@ class BERTClassifier:
 # 训练入口
 # ==========================================
 if __name__ == "__main__":
-    # 1. 配置模型路径 (请修改为你自己的本地路径或 HuggingFace 模型名)
-    MODEL_PATH = "/Users/chan/projects/models/bert-base-chinese"  # 例如："/path/to/bert-base-chinese"
-    OUTPUT_DIR = "./bert_classification_output"
+    # 1. 配置模型路径
+    MODEL_PATH = r"F:\small_project\aiagent\ailearn\rag\Itcast_qa_system\rag_qa\models\nlp_bert_document-segmentation_chinese-base"
+    OUTPUT_DIR = r"F:\small_project\aiagent\ailearn\rag\Itcast_qa_system\rag_qa\models\bert_classification_output"
 
-    # 2. 配置数据路径 (请确保文件存在)
-    TRAIN_FILE = "../classify_data/chatgpt_generate_200.jsonl"
-    EVAL_FILE = "../classify_data/chatgpt_generate_200_query.jsonl"
-    TEST_FILE = "test.jsonl"
-
-    # 3. 初始化分类器
+    # 2. 初始化分类器
     classifier = BERTClassifier(model_name_or_path=MODEL_PATH, output_dir=OUTPUT_DIR)
 
-    # 4. 配置训练参数 (可根据需要修改)
+    # 3. 从MongoDB加载所有数据
+    print("加载数据...")
+    all_dataset = classifier.load_data_from_mongo()
+
+    # 4. 拆分训练集和验证集（80%训练，20%验证）
+    split = all_dataset.train_test_split(test_size=0.2, seed=42)
+    train_dataset = split["train"]
+    eval_dataset = split["test"]
+    print(f"训练集: {len(train_dataset)} 条, 验证集: {len(eval_dataset)} 条")
+
+    # 5. 配置训练参数
     training_args = TrainingArguments(
         output_dir=OUTPUT_DIR,
-        num_train_epochs=1,
+        num_train_epochs=3,
         per_device_train_batch_size=16,
         per_device_eval_batch_size=16,
         learning_rate=2e-5,
@@ -281,34 +300,13 @@ if __name__ == "__main__":
         save_strategy="epoch",
         load_best_model_at_end=True,
         fp16=torch.cuda.is_available(),
-        report_to="none"
+        report_to="none",
+        logging_steps=10,
+        save_total_limit=2,
     )
 
-    # 5. 开始训练
-    # 注意：请确保当前目录下有对应的 jsonl 数据文件
-    # 如果没有，脚本会报错，请创建示例数据或修改路径
-    try:
-        classifier.train(TRAIN_FILE, EVAL_FILE, training_args)
+    # 6. 开始训练
+    print("\n开始训练...")
+    classifier.train(train_dataset, eval_dataset, training_args)
 
-        # 6. 测试评估 (生成报告和混淆矩阵)
-        if os.path.exists(TEST_FILE):
-            classifier.evaluate(TEST_FILE)
-        else:
-            print("Test file not found, skipping evaluation.")
-
-    except FileNotFoundError as e:
-        print(f"Error: {e}")
-        print("Please create sample data files (train.jsonl, dev.jsonl, test.jsonl) to run training.")
-        # 创建示例数据以便用户测试代码运行
-        print("Generating sample data for demonstration...")
-        sample_data = [
-                          {"query": "人工智能专业的学费可以申请助学贷款吗？", "label": "专业咨询"},
-                          {"query": "Java 培训的课程顾问联系方式？", "label": "专业咨询"},
-                          {"query": "今天天气怎么样？", "label": "通用知识"},
-                          {"query": "Python 和 Java 哪个更好学？", "label": "通用知识"}
-                      ] * 10  # 复制一些数据以满足 batch 大小
-        for name in [TRAIN_FILE, EVAL_FILE, TEST_FILE]:
-            with open(name, 'w', encoding='utf-8') as f:
-                for item in sample_data:
-                    f.write(json.dumps(item, ensure_ascii=False) + '\n')
-        print("Sample data created. Please run the script again.")
+    print("\n训练完成！")
