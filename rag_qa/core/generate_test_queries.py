@@ -21,7 +21,7 @@ from datetime import datetime
 # ========== 配置区（用户填充） ==========
 API_URL = "https://llm-166gm3uet4pq0skg.cn-beijing.maas.aliyuncs.com/compatible-mode/v1"  # 大模型API地址
 API_KEY = "sk-ws-H.PIIPRLH.u6xG.MEUCIQDIpcUvxopQujujOc0ftk6KOOcxQHH-saXyq1NoPcNXHgIgK1_ldr1TNH7cZCVFUqaO9yxdOonKf3ZrnmjTiinTcf8"  # 大
-MODEL_NAME = "deepseek-v4.1-flash"  # 模型名称
+MODEL_NAME = "qwen3.8-max-0902"  # 模型名称
 
 # 生成配置
 DOC_COUNT = 1000  # 从已入库的文档里抽多少篇来生成（跑全量就写大点，自动跳过已用过的）

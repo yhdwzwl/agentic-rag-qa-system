@@ -84,13 +84,17 @@ class MySQLClient:
 
     # ==================== child_chunks（子块表） ====================
     def insert_child_chunk(self, parent_id: int, chunk_index: int,
-                           content: str, char_count: int = None) -> int:
+                           content: str, char_count: int = None,
+                           chunk_type: str = 'text',
+                           is_table: int = 0,
+                           has_number: int = 0) -> int:
         """插入子块，返回 chunk_id"""
         sql = """INSERT INTO child_chunks
-                 (parent_id, chunk_index, content, char_count)
-                 VALUES (%s, %s, %s, %s)"""
+                 (parent_id, chunk_index, content, char_count, chunk_type, is_table, has_number)
+                 VALUES (%s, %s, %s, %s, %s, %s, %s)"""
         self.cursor.execute(sql, (parent_id, chunk_index, content,
-                                  char_count or len(content)))
+                                  char_count or len(content),
+                                  chunk_type, is_table, has_number))
         self.connection.commit()
         return self.cursor.lastrowid
 

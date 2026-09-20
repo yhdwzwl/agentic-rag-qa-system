@@ -1,7 +1,9 @@
-from .prompts import RAGPrompts
+﻿from .prompts import RAGPrompts
 #   导入 time 模块，用于计算时间
 import time
+from datetime import datetime
 from base import logger, Config
+from langchain_core.documents import Document
 from .query_classifier import QueryClassifier  # 导入查询分类器
 from .strategy_selector import StrategySelector  # 导入策略选择器
 
@@ -25,8 +27,40 @@ class RAGSystem:
         )
         #   初始化策略选择器
         self.strategy_selector = StrategySelector()
-        # 最大 128K 字符
-        self.max_prompt_length = 4096
+        # 初始化Redis向量缓存
+        try:
+            from .redis_vector_cache import RedisVectorCache
+            self.vector_cache = RedisVectorCache()
+            logger.info("Redis向量缓存初始化成功")
+        except Exception as e:
+            logger.warning(f"Redis向量缓存初始化失败，将跳过缓存: {e}")
+            self.vector_cache = None
+        # 最大8192字符
+        self.max_prompt_length = 16384
+
+        # 记录每次查询的中间产物
+        self.last_query_result = {
+            "query_text": "",
+            "generated_answer": "",
+            "full_prompt": "",
+            "contexts": [],
+            "retrieved_doc_ids": [],
+            "retrieved_scores": [],
+            "source_metas": [],
+            "retrieval_strategy": "",
+            "rewritten_query": "",
+            "classify_time": 0.0,
+            "rewrite_time": 0.0,
+            "cache_time": 0.0,
+            "retrieval_time": 0.0,
+            "rerank_time": 0.0,
+            "generation_time": 0.0,
+            "total_time": 0.0,
+            "cache_hit": False,
+            "cache_level": "",
+            "fallback": "",
+            "matched_companies": []
+        }
 
     #   定义私有方法，使用假设文档进行检索（HyDE）
     def _retrieve_with_hyde(self, query):
@@ -145,14 +179,14 @@ class RAGSystem:
 
         logger.info(f"策略 '{strategy}' 检索到 {len(ranked_sub_chunks)} 个候选文档 (可能已是父文档)")
         final_context_docs = ranked_sub_chunks[:conf.CANDIDATE_M]
-        logger.info(f"最终选取 {len(final_context_docs)} 个文档作为上下文")
+
         return final_context_docs
 
     # #   定义方法，生成答案
     # def generate_answer(self, query, source_filter=None):
     #     #   记录查询开始时间
     #     start_time = time.time()
-    #     logger.info(f"开始处理查询: '{query}', 学科过滤: {source_filter}")
+    #     logger.info(f"开始处理查询: '{query}', 公告类型过滤: {source_filter}")
     #
     #     #   判断查询类型
     #     query_category = self.query_classifier.predict_category(query)
@@ -162,7 +196,7 @@ class RAGSystem:
     #     if query_category == "通用知识":
     #         logger.info("查询为通用知识，直接调用 LLM")
     #         prompt_input = self.rag_prompt.format(
-    #             context="", question=query, phone=conf.CUSTOMER_SERVICE_PHONE
+    #             context="", question=query
     #         )  #   不使用上下文
     #         try:
     #             answer = self.llm(prompt_input)
@@ -196,7 +230,7 @@ class RAGSystem:
     #
     #     #   构造 Prompt，调用大语言模型生成答案
     #     prompt_input = self.rag_prompt.format(
-    #         context=context, question=query, phone=conf.CUSTOMER_SERVICE_PHONE
+    #         context=context, question=query
     #     )
     #     # logger.debug(f"最终生成的 Prompt:\n{prompt_input}") # Debug 日志
     #
@@ -217,7 +251,7 @@ class RAGSystem:
     def generate_answer(self, query, source_filter=None, history=None):
         """生成答案，支持对话历史，限制提示长度，并支持流式输出"""
         start_time = time.time()
-        logger.info(f"开始处理查询: '{query}', 学科过滤: {source_filter}")
+        logger.info(f"开始处理查询: '{query}', 公告类型过滤: {source_filter}")
 
         # 验证历史格式
         if history is not None and not isinstance(history, list):
@@ -240,31 +274,61 @@ class RAGSystem:
             logger.info(f"使用对话历史: {history_context[:100]}...")
 
         # 判断查询类型，通用知识还是专业知识
-        query_category = self.query_classifier.predict_category(query)
-        logger.info(f"查询分类结果: {query_category} (查询: '{query}')")
+        classify_start = time.time()
+        category_result = self.query_classifier.predict_category(query)
+        if isinstance(category_result, tuple):
+            query_category, matched_companies = category_result
+        else:
+            query_category, matched_companies = category_result, []
+        self.last_query_result["classify_time"] = time.time() - classify_start
+        self.last_query_result["query_text"] = query
+        self.last_query_result["matched_companies"] = matched_companies
+        logger.info(f"查询分类结果: {query_category} (查询: '{query}', 命中公司: {matched_companies})")
 
         # 准备上下文
         try:
-            if query_category == "通用知识":
+            retrieval_strategy = ""
+            if query_category in ("通用知识", "通用无关"):
                 logger.info("查询为通用知识，直接调用 LLM")
                 context = ""
+                context_docs = []
             else:
                 logger.info("查询为专业咨询，执行 RAG 流程")
-                strategy = self.strategy_selector.select_strategy(query)  # 根据用户的query选择检索策略
+                retrieval_strategy = self.strategy_selector.select_strategy(query)  # 根据用户的query选择检索策略
                 # 根据检索策略，返回检索上下文
+                retrieval_start = time.time()
                 context_docs = self.retrieve_and_merge(
-                    query, source_filter=source_filter, strategy=strategy
+                    query, source_filter=source_filter, strategy=retrieval_strategy
                 )
+                self.last_query_result["retrieval_time"] = time.time() - retrieval_start
                 context = "\n\n".join([doc.page_content for doc in context_docs]) if context_docs else ""
                 logger.info(f"构建上下文完成，包含 {len(context_docs)} 个文档块")
+
+                # 记录中间产物：上下文、来源、doc_ids
+                self.last_query_result["contexts"] = [doc.page_content for doc in context_docs]
+                self.last_query_result["retrieved_doc_ids"] = [
+                    str(doc.metadata.get("parent_id", "")) for doc in context_docs
+                ]
+                self.last_query_result["source_metas"] = [
+                    {
+                        "title": doc.metadata.get("file_name") or doc.metadata.get("name", ""),
+                        "code": doc.metadata.get("code", ""),
+                        "time": doc.metadata.get("timestamp", ""),
+                        "source": doc.metadata.get("source", ""),
+                        "name": doc.metadata.get("name", ""),
+                    }
+                    for doc in context_docs
+                ]
+
+            self.last_query_result["retrieval_strategy"] = retrieval_strategy
 
             # 构造提示
             prompt_input = self.rag_prompt.format(
                 context=context,
                 history=history_context,
-                question=query,
-                phone=conf.CUSTOMER_SERVICE_PHONE
+                question=query
             )
+            self.last_query_result["full_prompt"] = prompt_input
 
             # 截断提示（若超长）
             if len(prompt_input) > self.max_prompt_length:
@@ -273,28 +337,88 @@ class RAGSystem:
                 prompt_input = prompt_input[:self.max_prompt_length]
                 logger.info(f"截断后提示长度: {len(prompt_input)}")
 
-            processing_time = time.time() - start_time
-            logger.info(f"检索时间 (耗时: {processing_time:.2f}s, 查询: '{query}')")
-            start_time = time.time()
-
             # 调用 LLM（流式输出）
+            gen_start = time.time()
             try:
-                # 使用 generator 获取流式输出
-                for token in self.llm(prompt_input):
-                    yield token  # 直接将每个 token 传递给调用者
+                # 兼容两种 LLM 接口：
+                # 1) langchain 类（ChatOpenAI 等）：必须用 stream() 拿真正的流式 chunk，
+                #    invoke(stream=True) 只返回单个完整 AIMessage，对它迭代会得到 (字段, 值) 元组
+                # 2) call_dashscope 等生成器函数：直接调用返回迭代器，yield 字符串
+                answer_parts = []
+                if hasattr(self.llm, "stream"):
+                    # langchain 流式接口，chunk 为 AIMessageChunk，.content 是正文文本
+                    response = self.llm.stream(prompt_input)
+                    for chunk in response:
+                        token = chunk.content if isinstance(chunk.content, str) else str(chunk)
+                        answer_parts.append(token)
+                        yield token
+                else:
+                    # 生成器函数接口（如 new_main.py 的 call_dashscope）
+                    response = self.llm(prompt_input)
+                    for token in response:
+                        if isinstance(token, tuple):
+                            # 防御：某些流式封装 yield (role, content)，只取内容部分
+                            token = token[1] if len(token) > 1 else ""
+                        answer_parts.append(token)
+                        yield token
 
-                # 记录处理时间
-                processing_time = time.time() - start_time
-                logger.info(f"LLM查询处理完成 (耗时: {processing_time:.2f}s, 查询: '{query}')")
+                self.last_query_result["generated_answer"] = "".join(answer_parts)
+                self.last_query_result["generation_time"] = time.time() - gen_start
+                self.last_query_result["total_time"] = time.time() - start_time
+                logger.info(
+                    f"LLM查询处理完成 (生成耗时: {self.last_query_result['generation_time']:.2f}s, "
+                    f"总耗时: {self.last_query_result['total_time']:.2f}s, 查询: {query}"
+                )
+
+                # 保存本次查询的中间产物到 MongoDB（失败不影响主流程）
+                self._save_result_to_mongo()
             except Exception as e:
-                logger.error(f"调用 LLM 失败: {e}")
-                yield f"抱歉，处理您的问题时出错。请联系人工客服：{conf.CUSTOMER_SERVICE_PHONE}"
+                logger.error(f"调用LLM失败: {e}")
+                yield f"抱歉，处理您的问题时出错，请重试"
 
         except Exception as e:
             logger.error(f"答案生成失败: {e}")
-            yield f"抱歉，处理您的问题时出错。请联系人工客服：{conf.CUSTOMER_SERVICE_PHONE}"
+            yield f"抱歉，处理您的问题时出错，请重试"
 
+    def _save_result_to_mongo(self):
+        """将本次查询的中间产物写入 MongoDB rag_eval_results（失败不影响主流程）"""
+        try:
+            from pymongo import MongoClient
+            client = MongoClient("mongodb://localhost:27017/", serverSelectionTimeoutMS=3000)
+            col = client["rag_doc_data"]["rag_eval_results"]
+            doc = {
+                "source": "main_flow",
+                "query_text": self.last_query_result.get("query_text", ""),
+                "generated_answer": self.last_query_result.get("generated_answer", ""),
+                "full_prompt": self.last_query_result.get("full_prompt", ""),
+                "contexts": self.last_query_result.get("contexts", []),
+                "retrieved_doc_ids": self.last_query_result.get("retrieved_doc_ids", []),
+                "source_metas": self.last_query_result.get("source_metas", []),
+                "retrieval_strategy": self.last_query_result.get("retrieval_strategy", ""),
+                "classify_time": self.last_query_result.get("classify_time", 0.0),
+                "retrieval_time": self.last_query_result.get("retrieval_time", 0.0),
+                "generation_time": self.last_query_result.get("generation_time", 0.0),
+                "total_time": self.last_query_result.get("total_time", 0.0),
+                "cache_hit": self.last_query_result.get("cache_hit", False),
+                "matched_companies": self.last_query_result.get("matched_companies", []),
+                "eval_time": datetime.now(),
+            }
+            col.insert_one(doc)
+            client.close()
+            logger.info(
+                f"中间产物已写入 MongoDB rag_eval_results (query: {self.last_query_result.get('query_text', '')[:30]})"
+            )
+        except Exception as e:
+            logger.warning(f"写入 MongoDB 中间产物失败（不影响主流程）: {e}")
 # query 意图识别 使用bert 分类
 # 改进：
 # 1. 用LLM做意图识别，考虑最近几轮历史问答
 # 2. 最近几轮的query 拼接([CLS]current_query[SEP] history_query[SEP] ) 使用多轮对话数据训练Bert
+
+
+
+
+
+
+
+

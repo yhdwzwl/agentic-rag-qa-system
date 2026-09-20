@@ -1,4 +1,4 @@
-# -*- coding:utf-8 -*-
+﻿# -*- coding:utf-8 -*-
 # 导入 BGE-M3 嵌入函数，用于生成文档和查询的向量表示
 import torch.cuda
 from milvus_model.hybrid import BGEM3EmbeddingFunction
@@ -53,7 +53,7 @@ class VectorStore:
         m3_path = os.path.join(rag_qa_path, 'models', 'bge-m3')
         self.embedding_function = BGEM3EmbeddingFunction(
             model_name_or_path=m3_path,
-            use_fp16=(self.device == 'cuda'),
+            use_fp16=False,
             device=self.device
         )
         self.dense_dim = self.embedding_function.dim["dense"]
@@ -180,10 +180,16 @@ class VectorStore:
 
             # 写 MySQL child_chunks
             for idx, child in enumerate(children):
+                content = child.page_content
+                # 自动识别子块特征
+                chunk_type, is_table, has_number = self._detect_chunk_features(content)
                 chunk_id = self.mysql.insert_child_chunk(
                     parent_id=doc_id,
                     chunk_index=idx,
-                    content=child.page_content,
+                    content=content,
+                    chunk_type=chunk_type,
+                    is_table=is_table,
+                    has_number=has_number,
                 )
                 # 写 Milvus
                 text = child.page_content
@@ -228,6 +234,31 @@ class VectorStore:
         except Exception as e:
             logger.warning(f"稀疏向量转换失败: {e}")
         return sparse_vector
+
+    def _detect_chunk_features(self, content: str):
+        """
+        自动识别子块特征
+        返回: (chunk_type, is_table, has_number)
+        """
+        if not content:
+            return 'text', 0, 0
+
+        # 1. 判断是不是表格：包含多个 | 分隔符
+        line_count = content.count('\n')
+        pipe_count = content.count('|')
+        is_table = 1 if pipe_count >= 5 and line_count >= 2 else 0
+        chunk_type = 'table' if is_table else 'text'
+
+        # 2. 判断有没有数字/金额
+        import re
+        has_number = 1 if re.search(r'\d+\.?\d*', content) else 0
+
+        return chunk_type, is_table, has_number
+
+    def get_query_vector(self, query: str):
+        """生成query的稠密向量（给Redis缓存用）"""
+        query_embeddings = self.embedding_function([query])
+        return query_embeddings["dense"][0]
 
     def hybrid_search_with_rerank(self, query, k=conf.RETRIEVAL_K, source_filter=None):
         """
@@ -331,3 +362,7 @@ class VectorStore:
 if __name__ == "__main__":
     vector_store = VectorStore()
     print("VectorStore 初始化成功")
+
+
+
+

@@ -72,6 +72,24 @@ def process_one_file(fname, mongo_col, vs):
                 skip_count += 1
             return "skip", fname
 
+        # 1.5 检查：上次处理到一半，parent_docs已经入库了，只是status没update成done
+        # 这种情况直接补update成done，不用重新解析
+        if existing:
+            # 查一下这个文件有没有已经入库的parent_docs
+            mysql.cursor.execute("SELECT COUNT(*) as cnt FROM parent_docs WHERE file_name=%s", (fname,))
+            doc_count = mysql.cursor.fetchone()['cnt']
+            if doc_count > 0:
+                # 已经入库了，直接补update成done
+                mysql.update_pdf_status(existing['id'], "done",
+                                        parse_method="markitdown",
+                                        complexity_score=1,
+                                        parent_count=doc_count,
+                                        child_count=0)
+                with lock:
+                    skip_count += 1
+                logger.info(f"  补全状态: {fname[:40]} 已有{doc_count}个父块，直接标记done")
+                return "skip", fname
+
         # 1.5 文件大小限制：只跑指定区间的文件
         # 分段跑：先跑 <1MB 的
         MIN_SIZE_MB = 0

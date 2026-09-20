@@ -1,4 +1,4 @@
-#   导入 PromptTemplate 类，用于创建 Prompt 模板
+﻿#   导入 PromptTemplate 类，用于创建 Prompt 模板
 from langchain.prompts import PromptTemplate
 
 
@@ -14,7 +14,9 @@ class RAGPrompts:
 
         1. **分析问题和上下文**：
            - 基于提供的上下文（如果有）和你的知识回答问题。
-           - 如果答案来源于检索到的文档，请在回答中明确说明，例如："根据提供的文档，……"。
+           - 如果答案来源于检索到的文档，必须在回答末尾附上来源，格式：
+             "---
+             信息来源：请根据上下文里的公司名和公告类型列出你引用的所有来源"
 
         2. **评估对话历史**：
            - 检查对话历史是否与当前问题相关（例如，是否涉及相同的话题、实体或问题背景）。
@@ -24,12 +26,11 @@ class RAGPrompts:
         3. **生成回答**：
            - 提供清晰、准确的回答，避免无关信息。
            - 如果上下文和历史消息均不足以回答问题，请明确说明"根据现有资料，暂时无法回答这个问题"。
-
+        **问题**: {question}
         **上下文**: {context}
         **对话历史**:
         {history}
-        **问题**: {question}
-
+        
         **回答**:
         """,
             input_variables=["context", "history", "question"],
@@ -68,13 +69,24 @@ class RAGPrompts:
     def backtracking_prompt():
         #   创建并返回 PromptTemplate 对象
         return PromptTemplate(
-            template="""  
-            将以下复杂查询简化为一个更简单的问题：  
-            查询: {query}  
-            简化问题：  
+            template="""
+            你是一个金融搜索专家。请根据对话历史，把用户当前的问题改写成更适合在股票公告库中检索的形式。
+
+            对话历史：
+            {history}
+
+            用户当前问题：{query}
+
+            要求：
+            1. 结合历史，把"它"、"这个"、"该公司"这种指代替换成具体的公司名
+            2. 保留原意，不要改变核心意图
+            3. 增加金融领域的专业关键词
+            4. 去掉口语化的废话，让query更精炼
+
+            改写后的搜索query：
             """,
             #   定义输入变量
-            input_variables=["query"],
+            input_variables=["query", "history"],
         )
 
     #   定义金融场景query改写 Prompt 模板
@@ -83,18 +95,24 @@ class RAGPrompts:
         #   创建并返回 PromptTemplate 对象
         return PromptTemplate(
             template="""
-            你是一个金融搜索专家。请把用户的问题改写成更适合在股票公告库中检索的形式。
+            你是一个金融搜索专家。请根据对话历史，把用户的问题改写成更适合在股票公告库中检索的形式。
+
+            对话历史：
+            {history}
+
+            用户问题：{query}
 
             要求：
-            1. 保留原意，不要改变问题的核心意图
-            2. 补充指代信息（比如"它"、"这个公司"具体指什么）
+            1. 结合历史，把"它"、"这个公司"具体指什么补全
+            2. 保留原意，不要改变问题的核心意图
             3. 增加金融领域的专业关键词，提升检索匹配度
             4. 去掉口语化的废话，让query更精炼
             5. 如果问题太模糊，请明确化
 
-            用户问题：{query}
             改写后的搜索query：
             """,
             #   定义输入变量
-            input_variables=["query"],
+            input_variables=["query", "history"],
         )
+
+
