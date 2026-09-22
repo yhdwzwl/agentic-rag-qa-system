@@ -62,6 +62,15 @@ class Config:
         self.DASHSCOPE_BASE_URL = self.config.get('llm', 'dashscope_base_url',
                                                   fallback='https://dashscope.aliyuncs.com/compatible-mode/v1')
 
+        # 表格语义化增强配置（双轨方案：只改 Milvus 向量化文本，MySQL 原文不动）
+        # 可用模型名列表（逗号分隔，按优先级；额度用尽自动切换下一个）
+        self.TABLE_LLM_MODELS = [m.strip() for m in
+                                 self.config.get('llm', 'table_llm_models', fallback='').split(',') if m.strip()]
+        # 表格语义化增强总开关（false=仅规则转写不调 LLM；true=复杂表按需调 LLM）
+        self.TABLE_ENHANCE_ENABLED = self.config.getboolean('llm', 'table_enhance_enabled', fallback=False)
+        # 表格 LLM 增强调用超时（秒）
+        self.TABLE_LLM_TIMEOUT = self.config.getint('llm', 'table_llm_timeout', fallback=30)
+
         # 妫€绱㈠弬鏁?
         # 鐖跺潡澶у皬
         self.PARENT_CHUNK_SIZE = self.config.getint('retrieval', 'parent_chunk_size', fallback=1200)

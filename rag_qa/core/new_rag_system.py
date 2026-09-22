@@ -9,6 +9,10 @@ from .strategy_selector import StrategySelector  # 导入策略选择器
 
 conf = Config()
 
+# 精确数字型 query 触发词：命中则表格块上下文用原文（保证精确数字可查），未命中用 [表格] 摘要
+PRECISE_QUERY_WORDS = ["多少", "几", "分别", "具体", "明细", "逐项",
+                       "列出", "到底", "数值", "金额是", "具体数字", "具体金额"]
+
 
 #   定义 RAGSystem 类，封装 RAG 系统的核心逻辑
 class RAGSystem:
@@ -182,6 +186,12 @@ class RAGSystem:
 
         return final_context_docs
 
+    def _is_precise_query(self, query: str) -> bool:
+        """判断是否为精确数字型 query（命中触发词则表格块上下文用原文而非摘要）"""
+        if not query:
+            return False
+        return any(w in query for w in PRECISE_QUERY_WORDS)
+
     # #   定义方法，生成答案
     # def generate_answer(self, query, source_filter=None):
     #     #   记录查询开始时间
@@ -301,11 +311,21 @@ class RAGSystem:
                     query, source_filter=source_filter, strategy=retrieval_strategy
                 )
                 self.last_query_result["retrieval_time"] = time.time() - retrieval_start
-                context = "\n\n".join([doc.page_content for doc in context_docs]) if context_docs else ""
-                logger.info(f"构建上下文完成，包含 {len(context_docs)} 个文档块")
+                # 上下文分流：表格块在概览型 query 下用 [表格] 语义摘要（LLM 易读），
+                # 精确数字型 query 或非表格块用父块原文（保证精确数字可查）
+                is_precise = self._is_precise_query(query)
+                context_parts = []
+                for doc in context_docs:
+                    summaries = doc.metadata.get("table_summaries")
+                    if summaries and not is_precise:
+                        context_parts.append("\n".join(summaries))
+                    else:
+                        context_parts.append(doc.page_content)
+                context = "\n\n".join(context_parts) if context_parts else ""
+                logger.info(f"构建上下文完成，包含 {len(context_docs)} 个文档块 (精确型={is_precise})")
 
                 # 记录中间产物：上下文、来源、doc_ids
-                self.last_query_result["contexts"] = [doc.page_content for doc in context_docs]
+                self.last_query_result["contexts"] = context_parts
                 self.last_query_result["retrieved_doc_ids"] = [
                     str(doc.metadata.get("parent_id", "")) for doc in context_docs
                 ]

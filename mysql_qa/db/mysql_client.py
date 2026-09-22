@@ -92,16 +92,16 @@ class MySQLClient:
                            is_table: int = 0,
                            has_number: int = 0,
                            heading: str = None, heading_level: int = None,
-                           heading_path: str = None) -> int:
+                           heading_path: str = None, page_no: int = None) -> int:
         """插入子块，返回 chunk_id"""
         sql = """INSERT INTO child_chunks
                  (parent_id, chunk_index, content, char_count, chunk_type, is_table, has_number,
-                  heading, heading_level, heading_path)
-                 VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)"""
+                  heading, heading_level, heading_path, page_no)
+                 VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)"""
         self.cursor.execute(sql, (parent_id, chunk_index, content,
                                   char_count or len(content),
                                   chunk_type, is_table, has_number,
-                                  heading, heading_level, heading_path))
+                                  heading, heading_level, heading_path, page_no))
         self.connection.commit()
         return self.cursor.lastrowid
 

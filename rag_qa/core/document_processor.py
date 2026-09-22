@@ -148,6 +148,7 @@ class DocumentParser:
         self.image_dir = ""
         self.actual_method = ""  # 记录实际用的解析方式
         self.extracted_images = []  # 提取的图片列表
+        self.page_signatures = []  # 每页文本签名（去空白），用于子块→页码反查
 
     def parse(self) -> str:
         if self.use_mineru:
@@ -178,6 +179,8 @@ class DocumentParser:
         # 用全局单例 Parser，避免重复加载模型
         result = MINERU_PARSER.parse(self.file_path)
         text = result.markdown()
+        # 构建每页文本签名（blocks 原始文本），供子块切分后反查页码
+        self._build_page_signatures_from_mineru(result)
         # 提取图片 base64，正文替换成占位符
         text = self._extract_images(text)
         return text
@@ -187,9 +190,50 @@ class DocumentParser:
         md = MarkItDown()
         result = md.convert(self.file_path)
         text = result.text_content
+        # 用 PDF 文本层构建每页签名（markitdown 无结构化页码，走文本层反查）
+        self._build_page_signatures_from_pdf()
         # 提取图片 base64
         text = self._extract_images(text)
         return text
+
+    def _collect_block_text(self, obj, out: list):
+        """递归提取 block/span 中的全部文本字符串（含表格 HTML 内容）"""
+        if isinstance(obj, str):
+            out.append(obj)
+        elif isinstance(obj, (list, tuple)):
+            for x in obj:
+                self._collect_block_text(x, out)
+        elif obj is not None and hasattr(obj, "content"):
+            self._collect_block_text(obj.content, out)
+
+    def _build_page_signatures_from_mineru(self, result):
+        """从 MinerU 每页 blocks 提取文本，构建页签名（去空白）"""
+        import re
+        sigs = []
+        try:
+            for pg in result.pages:
+                texts = []
+                for b in pg.blocks:
+                    self._collect_block_text(b, texts)
+                sigs.append(re.sub(r"\s+", "", "".join(texts)))
+        except Exception as e:
+            logger.warning(f"[页码签名] MinerU 页签名构建失败: {e}")
+            sigs = []
+        self.page_signatures = sigs
+        logger.info(f"[页码签名] 已构建 {len(sigs)} 页签名")
+
+    def _build_page_signatures_from_pdf(self):
+        """用 PyMuPDF 文本层构建页签名（markitdown 路径）"""
+        import re
+        try:
+            import fitz
+            doc = fitz.open(self.file_path)
+            self.page_signatures = [re.sub(r"\s+", "", p.get_text()) for p in doc]
+            doc.close()
+            logger.info(f"[页码签名] PDF 文本层构建 {len(self.page_signatures)} 页签名")
+        except Exception as e:
+            logger.warning(f"[页码签名] PDF 文本层签名失败: {e}")
+            self.page_signatures = []
 
     def _extract_images(self, text: str) -> str:
         """从 Markdown 中提取 base64 图片，存到 self.extracted_images，正文替换成占位符"""
@@ -296,7 +340,7 @@ class StructureAwareSplitter:
                  min_parent_size: int = 200,
                  max_parent_size: int = 1200,
                  min_child_size: int = 100,
-                 max_child_size: int = 300,
+                 max_child_size: int = 350,
                  overlap_ratio: float = 0.2):
         self.min_parent = min_parent_size
         self.max_parent = max_parent_size
@@ -313,6 +357,9 @@ class StructureAwareSplitter:
             markdown_text = self._protect_cover(markdown_text, cover_text)
         # 预处理1：清洗 markitdown 伪表格残留（裸分隔线行、普通文本里夹的 |）
         markdown_text = self._clean_pseudo_table_noise(markdown_text)
+        # 预处理1.5：剔除目录（TOC）条目行——"第X章/节...点号+页码"导航行，
+        # 无语义价值且点线是向量化噪声；章节名在正文中本就有 heading 块
+        markdown_text = self._strip_toc_lines(markdown_text)
         # 预处理2：把完整表格块保护成占位符，避免父块切分把表格从中间截断
         # （截断后的表格碎片特征失真，伪表格会漏过判定）
         markdown_text = self._protect_tables(markdown_text)
@@ -366,21 +413,15 @@ class StructureAwareSplitter:
             else:
                 final_parents.append((heading, level, path, content))
 
-        # 第三步：父块间 20% 重叠（当前父块开头附加上一父块尾部），再切子块
+        # 第三步：父块不再做 overlap（避免跨父块大段重复；子块层已有 overlap 足够）
         all_children = []
-        prev_tail = ""
         for idx, (heading, level, path, content) in enumerate(final_parents):
             parent_id = f"parent_{idx}"
-            is_cover = (heading == "文件封面")
-            if prev_tail and content and not is_cover:
-                content = prev_tail + "\n\n" + content
             parent_text = f"# {heading}\n{content}".strip()
             children = self._split_into_children(content, parent_id, parent_text, heading, level, path)
             all_children.extend(children)
-            # 记录当前父块尾部，供下一父块重叠（重叠量 = max_parent * 20%；
-            # 避开表格占位符中间截断）。封面父块不产生重叠尾巴，避免整页封面重复进入下一父块
-            if not is_cover:
-                prev_tail = self._safe_tail(content, self.parent_overlap)
+        # 跨子块前缀去重：相邻块开头若与上一块尾部大段重复，截掉（双保险）
+        all_children = self._dedup_prefix_overlap(all_children)
 
         # 表格去重：同一张表的 HTML/Markdown 多格式只保留一份（单元格指纹相似 >0.9 判定同表）
         all_children = self._dedup_table_chunks(all_children)
@@ -592,6 +633,29 @@ class StructureAwareSplitter:
                 line = line.replace("|", " ")
             cleaned.append(line)
         return "\n".join(cleaned)
+
+    # 目录行：可选列表前缀(-/*/•) + "第X章/节/编/篇" 开头 + 任意标题 + 结尾连续点号(>=2) + 页码
+    _TOC_LINE_RE = re.compile(
+        r"^\s*[-*\u2022]?\s*第[一二三四五六七八九十百零\d]+[章节编篇部分].*?\.{2,}\s*\d{1,5}\s*$"
+    )
+
+    def _strip_toc_lines(self, text: str) -> str:
+        """剔除目录(TOC)条目行。目录是导航元数据（章节名+页码），对 RAG 检索无语义价值，
+        且 '....' 点线是向量化噪声；章节标题在正文中本就有 heading 块，剔除无信息损失。
+        只删目录条目行，保留 '目 录' 标题行与正文段落。"""
+        lines = text.split("\n")
+        kept, removed = [], 0
+        for line in lines:
+            stripped = line.strip()
+            if stripped and self._TOC_LINE_RE.match(stripped):
+                removed += 1
+                continue
+            kept.append(line)
+        if removed:
+            out = "\n".join(kept)
+            out = re.sub(r"\n{3,}", "\n\n", out)  # 清理删行留下的连续空行
+            return out
+        return text
 
     def _is_fake_table(self, lines: List[str]) -> bool:
         """增强版伪表格判定。markitdown 常把"空格对齐的正文文本"误判为表格，
@@ -893,34 +957,90 @@ class StructureAwareSplitter:
                                 continue
                             if len(chunk) + len(sent) > limit and chunk:
                                 flush()
-                                chunk = chunk[-self.overlap:] + sent
+                                chunk = self._tail_at_boundary(chunk, self.overlap) + sent
                             else:
                                 chunk = chunk + sent if chunk else sent
                     else:
                         if len(chunk) + len(para) > limit and chunk:
                             flush()
-                            chunk = chunk[-self.overlap:] + "\n\n" + para
+                            chunk = self._tail_at_boundary(chunk, self.overlap) + "\n\n" + para
                         else:
                             chunk = chunk + "\n\n" + para if chunk else para
         flush()
         return children
 
+    # 句界标点（用于 overlap 回退与硬切断点选择）
+    _SENT_BOUNDARY = "。！？；\n"
+    _SOFT_PUNCT = "，、；。！？\n"
+
+    def _tail_at_boundary(self, text: str, keep: int) -> str:
+        """取 text 尾部约 keep 字作为新块开头，但回退到最近句界，
+        避免新块从词/列举中间（如'、子女'）开始。"""
+        if len(text) <= keep:
+            return text
+        anchor = len(text) - keep
+        search_start = max(0, anchor - 40)
+        best = -1
+        for m in re.finditer(r"[。！？；\n]", text[search_start:anchor]):
+            pos = search_start + m.end()
+            if pos > best:
+                best = pos
+        # 句界不能回退过头（最多再退 keep 字）
+        if best >= 0 and best >= anchor - keep:
+            return text[best:]
+        return text[anchor:]
+
     def _hard_split(self, text: str, size: int, overlap: int):
-        """按字符硬切超长文本为多片；overlap>0 时相邻片保留 overlap 字符重叠"""
+        """超长文本切片；优先在标点处断，避免从词中间切断；片间保留 overlap 重叠。"""
         if len(text) <= size:
             return [text]
         pieces = []
-        step = size - overlap
-        if step < 1:
-            step = 1
         start = 0
         while start < len(text):
             end = min(start + size, len(text))
+            if end < len(text):
+                # 在 [end-40, end] 找最近标点作断点
+                window_start = max(start, end - 40)
+                best = -1
+                for punct in self._SOFT_PUNCT:
+                    p = text.rfind(punct, window_start, end)
+                    if p > best:
+                        best = p
+                if best > start + 20:  # 至少保留 20 字内容才回退
+                    end = best + 1
             pieces.append(text[start:end])
             if end >= len(text):
                 break
-            start += step
+            start = max(end - overlap, start + 1)
         return pieces
+
+    def _longest_overlap(self, tail: str, head: str) -> int:
+        """tail 后缀与 head 前缀的最长公共长度（>=20 才返回）。"""
+        max_n = min(len(tail), len(head), 100)
+        for n in range(max_n, 19, -1):
+            if tail[-n:] == head[:n]:
+                return n
+        return 0
+
+    def _dedup_prefix_overlap(self, chunks):
+        """相邻子块前缀去重：当前块开头若与上一块尾部大段重复（>=20字公共串），
+        截掉当前块的重复前缀。表格块不动。"""
+        if len(chunks) < 2:
+            return chunks
+        out = [chunks[0]]
+        for cur in chunks[1:]:
+            if cur.metadata.get("is_table"):
+                out.append(cur); continue
+            prev = out[-1].page_content
+            ct = cur.page_content
+            ov = self._longest_overlap(prev[-120:], ct[:150])
+            if ov >= 20 and ov / max(1, min(80, len(ct))) > 0.5:
+                ct = ct[ov:].lstrip("\n ")
+                if len(ct) <= 4:  # 截后成残片则整块丢弃
+                    continue
+                cur.page_content = ct
+            out.append(cur)
+        return out
 
     def _make_child(self, text: str, parent_id: str, child_idx: int, parent_text: str,
                     heading: str = "", heading_level: int = 0, heading_path: str = "",
@@ -995,6 +1115,24 @@ class StructureAwareSplitter:
 # ==================== 主流程 ====================
 MINERU_READY = False  # 全局标记：MinerU 模型是否已就绪
 MINERU_PARSER = None  # 全局单例的 MinerUParser 对象
+
+
+def locate_page(text: str, page_signatures) -> int:
+    """按子块内容反查页码（1 基）；匹配不到返回 None
+    先按子块前 80 字符整段匹配，失败降级按 15 字以上片段匹配。"""
+    if not page_signatures:
+        return None
+    key = re.sub(r"\s+", "", text[:80])
+    if key:
+        for i, sig in enumerate(page_signatures):
+            if key in sig:
+                return i + 1
+    pieces = re.findall(r"[\u4e00-\u9fffA-Za-z0-9]{15,}", re.sub(r"\s+", "", text))
+    for piece in pieces:
+        for i, sig in enumerate(page_signatures):
+            if piece in sig:
+                return i + 1
+    return None
 
 
 def warmup_mineru():
@@ -1075,7 +1213,13 @@ def process_pdf(file_path: str) -> List[Document]:
         cover_len = len(re.sub(r"\s", "", cover_text))
         logger.info(f"[封面检测] 第一页去空白 {cover_len} 字符 < 300，作为封面页整页保护")
     chunks = splitter.split(md_text, metadata, cover_text=cover_text)
-    logger.info(f"生成子块: {len(chunks)} 个")
+    # 子块→页码反查（解析器已构建 page_signatures；纯文本 markitdown 走 PDF 文本层）
+    located = 0
+    for c in chunks:
+        c.metadata["page_no"] = locate_page(c.page_content, parser.page_signatures)
+        if c.metadata.get("page_no"):
+            located += 1
+    logger.info(f"生成子块: {len(chunks)} 个（定位页码 {located} 个）")
     return chunks, extracted_images
 
 

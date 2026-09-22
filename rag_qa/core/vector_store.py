@@ -24,6 +24,53 @@ sys.path.insert(0, project_root)
 
 from base import logger, Config
 from mysql_qa.db.mysql_client import MySQLClient
+# 表格语义化增强（双轨：只改 Milvus 向量化文本，MySQL 原文不动；模型额度用尽自动切换）
+from rag_qa.core.table_enhancer import TableEnhancer
+
+import re as _re
+
+# 数字上下标 Unicode 映射
+_SUBS = {'0':'\u2080','1':'\u2081','2':'\u2082','3':'\u2083','4':'\u2084',
+         '5':'\u2085','6':'\u2086','7':'\u2087','8':'\u2088','9':'\u2089'}
+_SUPS = {'0':'\u2070','1':'\u00b9','2':'\u00b2','3':'\u00b3','4':'\u2074',
+         '5':'\u2075','6':'\u2076','7':'\u2077','8':'\u2078','9':'\u2079'}
+# 常用 LaTeX 运算符 -> Unicode
+_LATEX_OPS = {
+    'times':'\u00d7','div':'\u00f7','cdot':'\u00b7','pm':'\u00b1','mp':'\u2213',
+    'leq':'\u2264','leqslant':'\u2266','geq':'\u2265','geqslant':'\u2267','neq':'\u2260',
+    'approx':'\u2248','equiv':'\u2261','in':'\u2208','notin':'\u2209',
+    'rightarrow':'\u2192','leftarrow':'\u2190','Rightarrow':'\u21d2','Leftarrow':'\u21d0',
+    'sum':'\u2211','prod':'\u220f','infty':'\u221e',
+    'alpha':'\u03b1','beta':'\u03b2','gamma':'\u03b3','delta':'\u03b4','theta':'\u03b8',
+    'pi':'\u03c0','lambda':'\u03bb','mu':'\u03bc','sigma':'\u03c3','phi':'\u03c6','omega':'\u03c9',
+    'Delta':'\u0394','Sigma':'\u03a3','Omega':'\u03a9',
+}
+
+def latex_to_text(text: str) -> str:
+    """把 LaTeX 数学式轻量转成可读 Unicode 文本（仅用于 Milvus 向量化层；MySQL 原文保真）。
+    处理：去 $$/$ 包裹、\mathrm/\mathbf/\text 去壳、常用运算符->Unicode、数字上下标->Unicode。
+    未识别命令保留原样，不做激进替换，避免改错语义。"""
+    if not text or ('\\' not in text and '$' not in text):
+        return text
+    s = text.replace('$$', '').replace('$', '')
+    # 数字上下标先转 Unicode（必须先于去壳：\mathrm{P_{0}} 中 {0} 嵌套在花括号内，
+    # 先把 _{0} 转成 ₀，去壳正则才不会因嵌套花括号失败）
+    s = _re.sub(r'_\s*\{\s*(\d+)\s*\}', lambda m: ''.join(_SUBS[d] for d in m.group(1)), s)
+    s = _re.sub(r'_\s*(\d)', lambda m: _SUBS[m.group(1)], s)
+    s = _re.sub(r'\^\s*\{\s*(\d+)\s*\}', lambda m: ''.join(_SUPS[d] for d in m.group(1)), s)
+    s = _re.sub(r'\^\s*(\d)', lambda m: _SUPS[m.group(1)], s)
+    # \command{arg} -> arg（去字体壳；此时花括号内已无嵌套上下标）
+    s = _re.sub(r'\\(?:mathrm|mathbf|text|boldsymbol|mathcal|mathit|operatorname)\s*\{([^{}]*)\}', r'\1', s)
+    # 运算符替换
+    for cmd, sym in _LATEX_OPS.items():
+        s = s.replace('\\' + cmd + ' ', sym).replace('\\' + cmd, sym)
+    # 去 \left \right \, \; \! \  等空白/分组命令
+    s = _re.sub(r'\\(?:left|right|,|;|!|\s)\b', '', s)
+    # 清理残留空格
+    s = _re.sub(r'[ \t]{2,}', ' ', s)
+    s = _re.sub(r' *\n *', '\n', s)
+    return s.strip()
+
 
 conf = Config()
 
@@ -65,6 +112,8 @@ class VectorStore:
 
         # 初始化 MySQL
         self.mysql = MySQLClient()
+        # 表格语义化增强器（懒加载：首次遇到表格子块才初始化，避免启动时网络开销）
+        self._table_enhancer = None
         self.logger.info("VectorStore 初始化完成")
 
     def _ensure_database_exists(self):
@@ -93,6 +142,8 @@ class VectorStore:
             # 不再存 parent_content（移到 MySQL）
             schema.add_field(field_name="source", datatype=DataType.VARCHAR, max_length=50)
             schema.add_field(field_name="timestamp", datatype=DataType.VARCHAR, max_length=50)
+            # 子块在原始 PDF 中的页码（1 基；解析无法定位时为 0）
+            schema.add_field(field_name="page_no", datatype=DataType.INT32)
 
             index_params = self.client.prepare_index_params()
             index_params.add_index(
@@ -202,6 +253,7 @@ class VectorStore:
                     heading=child.metadata.get("heading"),
                     heading_level=child.metadata.get("heading_level"),
                     heading_path=child.metadata.get("heading_path"),
+                    page_no=child.metadata.get("page_no"),
                 )
                 # 处理子块里的图片占位符
                 if extracted_images:
@@ -231,6 +283,11 @@ class VectorStore:
                         logger.info(f"    子块 {idx} 关联 {len(image_ids)} 张图片")
                 # 写 Milvus
                 text = child.page_content
+                # 表格子块语义化增强（双轨：只改向量化文本；MySQL content 保持原文，保证生成阶段数字保真）
+                if is_table and conf.TABLE_ENHANCE_ENABLED:
+                    text = self._get_table_enhancer().enhance(text)
+                # LaTeX 轻量去命令化（双轨：只改向量化文本；MySQL content 保留原始 LaTeX）
+                text = latex_to_text(text)
                 embeddings = self.embedding_function([text])
                 dense_vec = embeddings["dense"][0]
                 # scipy 稀疏矩阵不支持 [0] 切片，用 [[0]]
@@ -247,6 +304,7 @@ class VectorStore:
                     "parent_id": str(doc_id),  # 关联 MySQL 的 doc_id
                     "source": meta["source"],
                     "timestamp": meta["timestamp"],
+                    "page_no": child.metadata.get("page_no") or 0,
                 })
 
             # 更新文档状态
@@ -313,6 +371,12 @@ class VectorStore:
         except Exception as e:
             logger.warning(f"稀疏向量转换失败: {e}")
         return sparse_vector
+
+    def _get_table_enhancer(self):
+        """懒加载表格语义化增强器（只在启用且首次遇到表格子块时初始化）"""
+        if self._table_enhancer is None:
+            self._table_enhancer = TableEnhancer(conf, use_llm=conf.TABLE_ENHANCE_ENABLED)
+        return self._table_enhancer
 
     def _detect_chunk_features(self, content: str, splitter_is_table=None):
         """
@@ -389,16 +453,21 @@ class VectorStore:
         if not results:
             return []
 
-        # 3. 提取子块 + parent_id 列表
+        # 3. 提取子块 + parent_id 列表，并收集表格块的 [表格] 摘要
         sub_chunks = []
         parent_ids = set()
+        table_summaries_by_parent = {}
         for hit in results:
             entity = hit["entity"]
             pid = entity.get("parent_id")
+            text = entity.get("text", "")
             if pid:
                 parent_ids.add(int(pid))
+                # 表格块（[表格] 前缀）的摘要单独聚合，供上下文分流用
+                if text.startswith("[表格]"):
+                    table_summaries_by_parent.setdefault(int(pid), []).append(text)
             sub_chunks.append(Document(
-                page_content=entity.get("text", ""),
+                page_content=text,
                 metadata={
                     "parent_id": pid,
                     "source": entity.get("source"),
@@ -408,6 +477,12 @@ class VectorStore:
 
         # 4. MySQL 批量查父块内容
         parent_docs = self._get_parent_contents(list(parent_ids))
+
+        # 4.1 把表格摘要挂到对应父块的 metadata（供 generate_answer 上下文分流）
+        for doc in parent_docs:
+            pid = int(doc.metadata.get("parent_id", 0) or 0)
+            if pid in table_summaries_by_parent:
+                doc.metadata["table_summaries"] = table_summaries_by_parent[pid]
 
         # 5. 重排序
         if len(parent_docs) < 2:
