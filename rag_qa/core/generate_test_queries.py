@@ -98,7 +98,7 @@ def sample_parent_docs(count: int = 100):
     conn = pymysql.connect(
         host='localhost', port=3306,
         user='root', password='123456',
-        database='df_rag_v3', charset='utf8mb4'
+        database='df_rag_v4', charset='utf8mb4'
     )
     cur = conn.cursor(pymysql.cursors.DictCursor)
 

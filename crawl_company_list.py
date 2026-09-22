@@ -13,7 +13,7 @@ print("登录baostock:", lg.error_msg)
 # 连接MySQL
 conn = pymysql.connect(
     host='localhost', port=3306, user='root', password='123456',
-    database='df_rag_v3', charset='utf8mb4'
+    database='df_rag_v4', charset='utf8mb4'
 )
 cursor = conn.cursor()
 

@@ -42,7 +42,7 @@ class QueryClassifier:
         """从MySQL读所有上市公司简称，用于规则匹配"""
         try:
             import pymysql
-            conn = pymysql.connect(host='localhost', port=3306, user='root', password='123456', database='df_rag_v3', charset='utf8mb4')
+            conn = pymysql.connect(host='localhost', port=3306, user='root', password='123456', database='df_rag_v4', charset='utf8mb4')
             cursor = conn.cursor()
             cursor.execute("SELECT short_name FROM company_info")
             names = [row[0] for row in cursor.fetchall() if row[0]]

@@ -1,5 +1,5 @@
 import pymysql, io
-conn = pymysql.connect(host='127.0.0.1', user='root', password='123456', database='df_rag_v3', charset='utf8mb4')
+conn = pymysql.connect(host='127.0.0.1', user='root', password='123456', database='df_rag_v4', charset='utf8mb4')
 cursor = conn.cursor()
 cursor.execute("SELECT short_name FROM company_info WHERE short_name NOT LIKE '%%指数%%' AND short_name NOT LIKE '%%等权%%' AND short_name NOT LIKE '%%国债%%' AND short_name NOT LIKE '%%公司债%%' AND short_name NOT LIKE '%%转债%%'")
 all_companies = [row[0] for row in cursor.fetchall() if row[0] and len(row[0])>=2]
