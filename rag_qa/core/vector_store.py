@@ -1,4 +1,4 @@
-﻿# -*- coding:utf-8 -*-
+# -*- coding:utf-8 -*-
 # 导入 BGE-M3 嵌入函数，用于生成文档和查询的向量表示
 import torch.cuda
 from milvus_model.hybrid import BGEM3EmbeddingFunction
@@ -121,7 +121,7 @@ class VectorStore:
 
         self.client.load_collection(self.collection_name)
 
-    def add_documents(self, documents):
+    def add_documents(self, documents, extracted_images=None, file_id=None):
         """
         写入文档：先写 MySQL 拿 parent_id，再写 Milvus
         流程：
@@ -142,8 +142,11 @@ class VectorStore:
             parent_groups[pid].append(doc)
             parent_meta[pid] = {
                 "parent_content": doc.metadata.get("parent_content", ""),
+                "heading": doc.metadata.get("heading", ""),
+                "heading_level": doc.metadata.get("heading_level", 0),
+                "heading_path": doc.metadata.get("heading_path", ""),
                 "source": doc.metadata.get("source", "unknown"),
-                "timestamp": doc.metadata.get("timestamp", ""),
+                "timestamp": doc.metadata.get("timestamp") or doc.metadata.get("processed_at", ""),
                 "file_name": doc.metadata.get("file_name", ""),
                 "file_path": doc.metadata.get("file_path", ""),
                 "file_id": doc.metadata.get("file_id", None),
@@ -159,6 +162,7 @@ class VectorStore:
 
         # 2. 逐父块写入
         milvus_data = []
+        written_img_idx = set()  # 文件内已写入的图片索引（防父块重叠导致同一图重复入库）
         for orig_pid, children in parent_groups.items():
             meta = parent_meta[orig_pid]
 
@@ -175,14 +179,19 @@ class VectorStore:
                 parse_method=meta["parse_method"],
                 complexity_score=meta["complexity_score"],
                 parent_content=meta["parent_content"],  # 父块完整内容
+                heading=meta.get("heading"),
+                heading_level=meta.get("heading_level"),
+                heading_path=meta.get("heading_path"),
             )
             logger.info(f"  MySQL parent_docs 写入成功, doc_id={doc_id}")
 
             # 写 MySQL child_chunks
             for idx, child in enumerate(children):
                 content = child.page_content
-                # 自动识别子块特征
-                chunk_type, is_table, has_number = self._detect_chunk_features(content)
+                # 自动识别子块特征：优先用分块器的表格判定（已做伪表格过滤），
+                # 兜底再按内容特征重算，避免伪表格/普通文本被误判为表格
+                chunk_type, is_table, has_number = self._detect_chunk_features(
+                    content, child.metadata.get("is_table"))
                 chunk_id = self.mysql.insert_child_chunk(
                     parent_id=doc_id,
                     chunk_index=idx,
@@ -190,7 +199,36 @@ class VectorStore:
                     chunk_type=chunk_type,
                     is_table=is_table,
                     has_number=has_number,
+                    heading=child.metadata.get("heading"),
+                    heading_level=child.metadata.get("heading_level"),
+                    heading_path=child.metadata.get("heading_path"),
                 )
+                # 处理子块里的图片占位符
+                if extracted_images:
+                    import re
+                    image_ids = []
+                    placeholders = re.findall(r'\[IMAGE_(\d+)\]', content)
+                    for ph in placeholders:
+                        img_idx = int(ph)
+                        if img_idx in written_img_idx:
+                            continue  # 同一图片已在前面子块写入（父块重叠区域），跳过
+                        if img_idx < len(extracted_images):
+                            img = extracted_images[img_idx]
+                            image_id = self.mysql.insert_image(
+                                file_id=file_id,
+                                parent_id=doc_id,
+                                chunk_id=chunk_id,
+                                chunk_index=idx,
+                                image_data=img['image_data'],
+                                image_type=img['image_type'],
+                                image_caption=img.get('image_caption', ''),
+                                image_size_kb=len(img['image_data']) / 1024
+                            )
+                            written_img_idx.add(img_idx)
+                            image_ids.append(image_id)
+                    if image_ids:
+                        self.mysql.update_chunk_image_ids(chunk_id, image_ids)
+                        logger.info(f"    子块 {idx} 关联 {len(image_ids)} 张图片")
                 # 写 Milvus
                 text = child.page_content
                 embeddings = self.embedding_function([text])
@@ -219,6 +257,47 @@ class VectorStore:
             self.client.upsert(collection_name=self.collection_name, data=milvus_data)
             logger.info(f"Milvus 已插入 {len(milvus_data)} 条子块")
 
+    def delete_by_file(self, file_id: int):
+        """
+        按 file_id 清理该文件的全部残留数据（MySQL + Milvus），用于断点续跑/崩溃恢复。
+        清理后该文件可安全重新入库，避免重复或孤儿数据。
+        """
+        # 1. 先按 file_id 查父块；历史数据 file_id 可能为 None，再用 file_name 兜底
+        parent_ids = []
+        fname = None
+        self.mysql.cursor.execute("SELECT file_name FROM pdf_files WHERE id=%s", (file_id,))
+        row = self.mysql.cursor.fetchone()
+        if row:
+            fname = row["file_name"]
+        if fname is None:
+            logger.warning(f"delete_by_file: pdf_files 无记录 id={file_id}，跳过清理")
+            return
+
+        self.mysql.cursor.execute(
+            "SELECT id FROM parent_docs WHERE file_id=%s OR file_name=%s", (file_id, fname))
+        parent_ids = [str(r["id"]) for r in self.mysql.cursor.fetchall()]
+
+        # 2. 删 Milvus 向量（按 parent_id）
+        if parent_ids:
+            expr = "parent_id in [" + ",".join(f'"{p}"' for p in parent_ids) + "]"
+            try:
+                self.client.delete(collection_name=self.collection_name, filter=expr)
+                logger.info(f"  Milvus 清理 {len(parent_ids)} 个父块对应向量: {expr}")
+            except Exception as e:
+                logger.warning(f"  Milvus 清理失败（忽略，重新入库会覆盖）: {e}")
+
+            # 3. 删 MySQL：先子表后父表
+            ph = ",".join(["%s"] * len(parent_ids))
+            self.mysql.cursor.execute(f"DELETE FROM child_chunks WHERE parent_id IN ({ph})", parent_ids)
+            self.mysql.cursor.execute(f"DELETE FROM doc_status WHERE parent_id IN ({ph})", parent_ids)
+            self.mysql.cursor.execute(f"DELETE FROM parent_docs WHERE id IN ({ph})", parent_ids)
+            # 3.5 删 doc_images（按 file_id；旧实现漏删导致孤儿图片随重跑累积）
+            self.mysql.cursor.execute("DELETE FROM doc_images WHERE file_id=%s", (file_id,))
+            self.mysql.connection.commit()
+            logger.info(f"  MySQL 清理完成: {len(parent_ids)} 个父块（file_id={file_id}），含 doc_images")
+        else:
+            logger.info(f"  delete_by_file: 无残留父块（file_id={file_id}）")
+
     def _to_sparse_dict(self, row):
         """将稀疏向量转成 Milvus 需要的 {index: value} 格式"""
         sparse_vector = {}
@@ -235,18 +314,26 @@ class VectorStore:
             logger.warning(f"稀疏向量转换失败: {e}")
         return sparse_vector
 
-    def _detect_chunk_features(self, content: str):
+    def _detect_chunk_features(self, content: str, splitter_is_table=None):
         """
         自动识别子块特征
         返回: (chunk_type, is_table, has_number)
+        splitter_is_table: 分块器在伪表格过滤后给出的表格判定（0/1/None）。
+        有判定时优先采用；无判定时兜底要求"存在标准表格分隔线"才算表格，
+        避免 markitdown 伪表格（大量 | 但无表格结构）入库被误判。
         """
         if not content:
             return 'text', 0, 0
 
-        # 1. 判断是不是表格：包含多个 | 分隔符
-        line_count = content.count('\n')
-        pipe_count = content.count('|')
-        is_table = 1 if pipe_count >= 5 and line_count >= 2 else 0
+        if splitter_is_table is not None:
+            is_table = 1 if splitter_is_table else 0
+        else:
+            # 兜底判定：标准 Markdown 表格必须有分隔线行（| --- | --- |）
+            lines = content.split('\n')
+            has_sep = any(('---' in l) and re.search(r'\|.*\|', l) for l in lines)
+            pipe_count = content.count('|')
+            line_count = content.count('\n')
+            is_table = 1 if (has_sep and pipe_count >= 5 and line_count >= 2) else 0
         chunk_type = 'table' if is_table else 'text'
 
         # 2. 判断有没有数字/金额

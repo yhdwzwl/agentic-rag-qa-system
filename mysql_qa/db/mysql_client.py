@@ -56,15 +56,18 @@ class MySQLClient:
                           name: str = None, pdf_time: str = None,
                           doc_type: str = None, parse_method: str = None,
                           complexity_score: int = None,
-                          parent_content: str = None) -> int:
+                          parent_content: str = None,
+                          heading: str = None, heading_level: int = None,
+                          heading_path: str = None) -> int:
         """插入父文档，返回 doc_id"""
         sql = """INSERT INTO parent_docs
                  (file_id, file_name, file_path, pdf_type, code, name, pdf_time, doc_type,
-                  parse_method, complexity_score, parent_content)
-                 VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)"""
+                  parse_method, complexity_score, parent_content, heading, heading_level, heading_path)
+                 VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)"""
         self.cursor.execute(sql, (file_id, file_name, file_path, pdf_type, code,
                                   name, pdf_time, doc_type, parse_method,
-                                  complexity_score, parent_content))
+                                  complexity_score, parent_content,
+                                  heading, heading_level, heading_path))
         self.connection.commit()
         return self.cursor.lastrowid
 
@@ -87,16 +90,41 @@ class MySQLClient:
                            content: str, char_count: int = None,
                            chunk_type: str = 'text',
                            is_table: int = 0,
-                           has_number: int = 0) -> int:
+                           has_number: int = 0,
+                           heading: str = None, heading_level: int = None,
+                           heading_path: str = None) -> int:
         """插入子块，返回 chunk_id"""
         sql = """INSERT INTO child_chunks
-                 (parent_id, chunk_index, content, char_count, chunk_type, is_table, has_number)
-                 VALUES (%s, %s, %s, %s, %s, %s, %s)"""
+                 (parent_id, chunk_index, content, char_count, chunk_type, is_table, has_number,
+                  heading, heading_level, heading_path)
+                 VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)"""
         self.cursor.execute(sql, (parent_id, chunk_index, content,
                                   char_count or len(content),
-                                  chunk_type, is_table, has_number))
+                                  chunk_type, is_table, has_number,
+                                  heading, heading_level, heading_path))
         self.connection.commit()
         return self.cursor.lastrowid
+
+    def insert_image(self, file_id: int, parent_id: int, chunk_id: int,
+                     chunk_index: int, image_data: str, image_type: str,
+                     image_caption: str = '', image_size_kb: float = 0) -> int:
+        """插入图片记录，返回 image_id"""
+        sql = """INSERT INTO doc_images
+                 (file_id, parent_id, chunk_id, chunk_index, image_data, image_type, image_caption, image_size_kb)
+                 VALUES (%s, %s, %s, %s, %s, %s, %s, %s)"""
+        self.cursor.execute(sql, (file_id, parent_id, chunk_id, chunk_index,
+                                  image_data, image_type, image_caption, image_size_kb))
+        self.connection.commit()
+
+        return self.cursor.lastrowid
+
+    def update_chunk_image_ids(self, chunk_id: int, image_ids: list):
+        """更新子块的 image_ids 字段"""
+        import json
+        sql = "UPDATE child_chunks SET image_ids = %s WHERE id = %s"
+        self.cursor.execute(sql, (json.dumps(image_ids), chunk_id))
+        self.connection.commit()
+
 
     def get_child_chunks_by_parent(self, parent_id: int) -> List[Dict]:
         self.cursor.execute(

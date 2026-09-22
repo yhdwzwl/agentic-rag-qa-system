@@ -72,23 +72,12 @@ def process_one_file(fname, mongo_col, vs):
                 skip_count += 1
             return "skip", fname
 
-        # 1.5 检查：上次处理到一半，parent_docs已经入库了，只是status没update成done
-        # 这种情况直接补update成done，不用重新解析
+        # 1.5 断点续跑：文件存在但未完成（pending/processing/failed）
+        # 清理上次入库可能残留的父块/子块/向量（MySQL+Milvus），再重新完整入库，
+        # 避免"半截入库被误判为完成"导致丢数据，也避免新旧 doc_id 并存产生孤儿数据
         if existing:
-            # 查一下这个文件有没有已经入库的parent_docs
-            mysql.cursor.execute("SELECT COUNT(*) as cnt FROM parent_docs WHERE file_name=%s", (fname,))
-            doc_count = mysql.cursor.fetchone()['cnt']
-            if doc_count > 0:
-                # 已经入库了，直接补update成done
-                mysql.update_pdf_status(existing['id'], "done",
-                                        parse_method="markitdown",
-                                        complexity_score=1,
-                                        parent_count=doc_count,
-                                        child_count=0)
-                with lock:
-                    skip_count += 1
-                logger.info(f"  补全状态: {fname[:40]} 已有{doc_count}个父块，直接标记done")
-                return "skip", fname
+            logger.info(f"  断点续跑清理残留: {fname[:40]}（上次状态={existing['status']}）")
+            vs.delete_by_file(existing['id'])
 
         # 1.5 文件大小限制：只跑指定区间的文件
         # 分段跑：先跑 <1MB 的
@@ -111,7 +100,7 @@ def process_one_file(fname, mongo_col, vs):
                 file_size=file_size,
                 code=doc_code,
                 name=doc_name,
-                pdf_type=doc_pdf_type,
+                pdf_type=doc_pdf_type or "unknown",
                 pdf_time=doc_pdf_time,
             )
             mysql.update_pdf_status(file_id, "failed", error_msg=f"文件大小{file_size_mb:.1f}MB，跳过（本轮只跑<1MB）")
@@ -136,13 +125,13 @@ def process_one_file(fname, mongo_col, vs):
             file_size=file_size,
             code=doc_code,
             name=doc_name,
-            pdf_type=doc_pdf_type,
+            pdf_type=doc_pdf_type or "unknown",
             pdf_time=doc_pdf_time,
         )
         mysql.update_pdf_status(file_id, "processing")
 
         # 4. 解析+分块
-        chunks = process_pdf(fpath)
+        chunks, extracted_images = process_pdf(fpath)
         if not chunks:
             raise RuntimeError("解析结果为空")
 
@@ -156,7 +145,7 @@ def process_one_file(fname, mongo_col, vs):
             c.metadata["file_id"] = file_id
 
         # 5. 入库（共享 vs 实例，BGE-M3 模型线程安全）
-        vs.add_documents(chunks)
+        vs.add_documents(chunks, extracted_images=extracted_images, file_id=file_id)
 
         # 6. 更新状态
         score = chunks[0].metadata.get("complexity_score", 0)

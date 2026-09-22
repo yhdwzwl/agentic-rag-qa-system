@@ -1,0 +1,34 @@
+__pycache__/
+*.pyc
+.env
+
+# ---- 日志与运行产物 ----
+*.log
+*_log.txt
+*_result.txt
+rerun_result.txt
+check_result.txt
+clear_result.txt
+mineru_test_result.txt
+high_complexity.txt
+
+# ---- 数据 ----
+pdf_data/
+pdf_data_skip/
+*.pdf
+
+# ---- IDE/临时 ----
+.idea/
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+
+# ---- 备份 ----
+*.bak_*
+
+# ---- 模型/中间输出 ----
+rag_qa/models/
+rag_qa/core/output/
+rag_qa/core/bert_outputs/
+rag_qa/core/bert_results/
+rag_qa/core/bert_query_classifier/
