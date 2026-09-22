@@ -41,8 +41,34 @@ def parse_code(fname):
     return m.group(1) if m else None
 
 
-def register_all(mysql):
-    """阶段1：登记全部 PDF 到 pdf_files（按 MD5 去重）"""
+def parse_art_code(fname):
+    """从文件名解析公告编号：000001_AN2026...pdf -> AN2026..."""
+    m = re.match(r"^\d{6}_(.+)\.pdf$", fname)
+    return m.group(1) if m else None
+
+
+def load_mongo_meta():
+    """从 MongoDB rag_doc_data.doc_url 加载 (code, art_code) -> 元数据 映射。
+    用于登记时补齐 pdf_type/name/pdf_time，避免入库时全部落成 unknown。
+    加载失败不阻塞入库（pdf_type 留空，由入库兜底处理）。"""
+    try:
+        from pymongo import MongoClient
+        mc = MongoClient("mongodb://localhost:27017/", serverSelectionTimeoutMS=5000)
+        col = mc["rag_doc_data"]["doc_url"]
+        meta = {}
+        for d in col.find({}, {"code": 1, "art_code": 1, "pdf_type": 1, "name": 1, "pdf_time": 1}):
+            if d.get("code") and d.get("art_code"):
+                meta[(d["code"], d["art_code"])] = d
+        mc.close()
+        logger.info(f"MongoDB 元数据加载完成: {len(meta)} 条 (code, art_code) 映射")
+        return meta
+    except Exception as e:
+        logger.warning(f"MongoDB 元数据加载失败（pdf_type 将回退 unknown）: {e}")
+        return {}
+
+
+def register_all(mysql, meta_map):
+    """阶段1：登记全部 PDF 到 pdf_files（按 MD5 去重；从 MongoDB 补齐业务元数据）"""
     files = [f for f in os.listdir(PDF_DIR) if f.lower().endswith(".pdf")]
     logger.info(f"目录发现 {len(files)} 个 PDF，开始登记...")
     # 已登记的 md5 集合
@@ -58,9 +84,15 @@ def register_all(mysql):
                 skipped += 1
                 continue
             size = os.path.getsize(fpath)
+            code = parse_code(fname)
+            art = parse_art_code(fname)
+            d = meta_map.get((code, art)) if (code and art) else None
             file_id = mysql.insert_pdf_file(
                 file_name=fname, file_path=fpath, file_md5=md5v,
-                file_size=size, code=parse_code(fname))
+                file_size=size, code=code,
+                name=(d.get("name") if d else None),
+                pdf_type=(d.get("pdf_type") or None) if d else None,
+                pdf_time=(d.get("pdf_time") if d else None))
             known.add(md5v)
             added += 1
             if added % 200 == 0:
@@ -73,13 +105,26 @@ def register_all(mysql):
 def main():
     vs = VectorStore()  # 加载 BGE-M3（初始化较慢）
     mysql = MySQLClient()
-    register_all(mysql)
+    meta_map = load_mongo_meta()
+    register_all(mysql, meta_map)
 
     # 待处理 = 未 done 的全部文件
     mysql.cursor.execute(
         "SELECT id, file_name, file_path, code, name, pdf_type, pdf_time, status "
         "FROM pdf_files WHERE status != 'done' ORDER BY id")
     todo = mysql.cursor.fetchall()
+    # 补充分类元数据：历史登记可能只写了 code（pdf_type=NULL），从 Mongo 补齐，
+    # 避免入库时 c.metadata["source"] 全部回退成 "unknown"
+    missing = [pf for pf in todo if not pf.get("pdf_type")]
+    if missing:
+        logger.info(f"从 MongoDB 补齐 {len(missing)} 个文件的 pdf_type/name/pdf_time")
+        for pf in missing:
+            art = parse_art_code(pf["file_name"])
+            d = meta_map.get((pf.get("code"), art)) if (pf.get("code") and art) else None
+            if d:
+                pf["pdf_type"] = d.get("pdf_type") or "unknown"
+                pf["name"] = d.get("name") or pf.get("name")
+                pf["pdf_time"] = d.get("pdf_time") or pf.get("pdf_time")
     done0 = 0
     mysql.cursor.execute("SELECT COUNT(*) AS c FROM pdf_files WHERE status='done'")
     done0 = mysql.cursor.fetchone()["c"]
