@@ -330,19 +330,9 @@ class TableLLMEnhancer:
     # ---------- 数字校验（防幻觉） ----------
     @classmethod
     def _extract_numeric_values(cls, text: str) -> set:
-        """提取文本中的数值（万/亿换算为绝对值），返回 set[float]"""
-        values = set()
-
-        def repl(m):
-            val = float(m.group(1))
-            unit = m.group(2)
-            values.add(val * (1e4 if unit == "万" else 1e8))
-            return ""
-
-        cls._UNIT_RE.sub(repl, text)
-        for m in cls._NUM_RE.finditer(text):
-            values.add(float(m.group(0)))
-        return values
+        """提取文本中的纯数值（不做万/亿换算，因为金融表格的单位在表头不在单元格）。
+        LLM 总结时会把表头单位加回去（如 10.00 万份），这里只对比数字本身。"""
+        return {float(m.group(0)) for m in cls._NUM_RE.finditer(text)}
 
     @staticmethod
     def _verify_numbers(summary: str, md_table: str) -> bool:
@@ -369,39 +359,61 @@ class TableLLMEnhancer:
         if cache_key in self._cache:
             return self._cache[cache_key]
 
-        for _ in range(len(self.models)):
-            model = self._next_model()
-            if model is None:
-                break
-            try:
-                resp = self.client.chat.completions.create(
-                    model=model,
-                    messages=[
-                        {"role": "system", "content": _TABLE_SYSTEM_PROMPT},
-                        {"role": "user", "content": md_table},
-                    ],
-                    timeout=30,
-                )
-                text = (resp.choices[0].message.content or "").strip()
-                if not text:
-                    logger.warning(f"[table_enhancer] 模型 {model} 返回空内容，切换下一个模型")
-                    continue
-                if not self._verify_numbers(text, md_table):
-                    logger.warning(f"[table_enhancer] 模型 {model} 输出数字校验未通过（疑似幻觉），切换下一个模型")
-                    self._failed.add(model)
-                    continue
-                self._cache[cache_key] = text
-                return text
-            except Exception as e:
-                if self._is_quota_error(e):
-                    logger.warning(f"[table_enhancer] 模型 {model} 额度用尽，自动切换下一个模型: {e}")
-                    self._failed.add(model)
-                else:
-                    logger.warning(f"[table_enhancer] 模型 {model} 调用失败，切换下一个模型: {e}")
-                    self._failed.add(model)
+        import time as _time
+        max_rounds = 3       # 临时错误（网络/超时）最多重试 3 轮
+        wait_sec = 60        # 每轮之间等 60 秒，等网络恢复
+
+        for round_no in range(1, max_rounds + 1):
+            temp_failed_this_round = []
+            for _ in range(len(self.models)):
+                model = self._next_model()
+                if model is None:
+                    break
+                try:
+                    resp = self.client.chat.completions.create(
+                        model=model,
+                        messages=[
+                            {"role": "system", "content": _TABLE_SYSTEM_PROMPT},
+                            {"role": "user", "content": md_table},
+                        ],
+                        timeout=30,
+                    )
+                    text = (resp.choices[0].message.content or "").strip()
+                    if not text:
+                        logger.warning(f"[table_enhancer] 模型 {model} 返回空内容，切换下一个模型")
+                        continue
+                    if not self._verify_numbers(text, md_table):
+                        logger.warning(f"[table_enhancer] 模型 {model} 输出数字校验未通过（疑似幻觉），降级 L1")
+                        return ""
+                    self._cache[cache_key] = text
+                    return text
+                except Exception as e:
+                    if self._is_quota_error(e):
+                        logger.warning(f"[table_enhancer] 模型 {model} 额度用尽，自动切换下一个模型: {e}")
+                        self._failed.add(model)
+                    else:
+                        # 临时错误（网络/超时），不永久拉黑，记下来等下轮重试
+                        logger.warning(f"[table_enhancer] 模型 {model} 临时失败（网络/超时），记下等下轮重试: {e}")
+                        temp_failed_this_round.append(model)
+
+            # 一轮跑完，看是不是还有可用模型
+            if self._next_model() is not None:
+                # 还有未失败的模型，继续试（应该不会走到这里，因为上面 for 已经遍历完）
+                continue
+            # 所有模型都试过了，如果还有临时失败的，等下一轮
+            if temp_failed_this_round and round_no < max_rounds:
+                logger.warning(f"[table_enhancer] 第 {round_no}/{max_rounds} 轮全部临时失败，{wait_sec}s 后重试...")
+                _time.sleep(wait_sec)
+                # 清空本轮临时失败标记，让下轮重新试这些模型
+                for m in temp_failed_this_round:
+                    self._failed.discard(m)
+                continue
+            break
+
         failed_models = sorted(self._failed)
         raise RuntimeError(
-            f"[table_enhancer] 所有 LLM 模型均不可用（已尝试 {len(failed_models)} 个：{failed_models}）。"
+            f"[table_enhancer] 所有 LLM 模型均不可用（已尝试 {len(failed_models)} 个：{failed_models}，"
+            f"临时错误重试 {max_rounds} 轮后仍失败）。"
             f"请检查 API Key 额度/网络后手动重跑断点；本次入库已暂停。"
         )
 

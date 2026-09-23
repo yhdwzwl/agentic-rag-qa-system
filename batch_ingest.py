@@ -96,6 +96,11 @@ def run_one(pdf_path: str, mysql: MySQLClient, vs: VectorStore):
         pdf_type=meta.get("pdf_type"), pdf_time=str(meta.get("pdf_time") or ""),
     )
 
+    # 2.5) 重跑 failed 文件前清理上次残留（MySQL child_chunks/parent_docs + Milvus vectors）
+    if existing and existing["status"] == "failed":
+        print(f"  [CLEAN] 重跑 failed 文件 file_id={file_id}，清理上次残留")
+        vs.delete_by_file(file_id)
+
     # 3) 解析
     t0 = time.time()
     chunks, images = process_pdf(pdf_path)
