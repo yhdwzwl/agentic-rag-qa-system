@@ -1,0 +1,76 @@
+# 云上 GPU 实例一键起中间件：MySQL 8 + Milvus standalone + Redis Stack
+# 用法：docker compose up -d
+# 端口与本地 config.ini 保持一致：MySQL 3306 / Milvus 19530 / Redis 6379
+# 数据持久化在 docker volume，实例关机不丢；导出后再 down 也不影响
+services:
+  mysql:
+    image: mysql:8.0
+    container_name: rag-mysql
+    restart: always
+    environment:
+      MYSQL_ROOT_PASSWORD: "123456"
+      MYSQL_DATABASE: df_rag_v4
+    ports:
+      - "3306:3306"
+    command: --character-set-server=utf8mb4 --collation-server=utf8mb4_general_ci
+    volumes:
+      - mysql-data:/var/lib/mysql
+
+  etcd:
+    image: quay.io/coreos/etcd:v3.5.5
+    container_name: rag-etcd
+    restart: always
+    environment:
+      ETCD_AUTO_COMPACTION_MODE: revision
+      ETCD_AUTO_COMPACTION_RETENTION: "1000"
+      ETCD_QUOTA_BACKEND_BYTES: "4294967296"
+      ETCD_SNAPSHOT_COUNT: "50000"
+    command: >
+      etcd -advertise-client-urls=http://etcd:2379
+         -listen-client-urls http://0.0.0.0:2379
+         --data-dir /etcd
+    volumes:
+      - etcd-data:/etcd
+
+  minio:
+    image: minio/minio:RELEASE.2023-03-20T20-16-18Z
+    container_name: rag-minio
+    restart: always
+    environment:
+      MINIO_ACCESS_KEY: minioadmin
+      MINIO_SECRET_KEY: minioadmin
+    command: minio server /minio_data
+    volumes:
+      - minio-data:/minio_data
+
+  milvus:
+    image: milvusdb/milvus:v2.4.5
+    container_name: rag-milvus
+    restart: always
+    depends_on: [etcd, minio]
+    environment:
+      ETCD_ENDPOINTS: etcd:2379
+      MINIO_ADDRESS: minio:9000
+    command: ["milvus", "run", "standalone"]
+    ports:
+      - "19530:19530"
+      - "9091:9091"
+    volumes:
+      - milvus-data:/var/lib/milvus
+
+  redis:
+    image: redis/redis-stack:latest
+    container_name: rag-redis
+    restart: always
+    ports:
+      - "6379:6379"
+      - "8001:8001"
+    volumes:
+      - redis-data:/data
+
+volumes:
+  mysql-data:
+  etcd-data:
+  minio-data:
+  milvus-data:
+  redis-data:
