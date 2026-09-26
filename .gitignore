@@ -1,6 +1,7 @@
 __pycache__/
 *.pyc
 .env
+config.ini
 
 # ---- 日志与运行产物 ----
 *.log
@@ -32,3 +33,16 @@ rag_qa/core/output/
 rag_qa/core/bert_outputs/
 rag_qa/core/bert_results/
 rag_qa/core/bert_query_classifier/
+
+# ---- 大文件/备份 ----
+*.tar
+pdf_data.tar
+bge-m3.tar
+bge-reranker-large.tar
+
+# ---- 交接文档（不公开） ----
+文档解析入库模块交接文档*.md
+文档解析模块*.md
+
+pdf_data_v1/
+*.zip

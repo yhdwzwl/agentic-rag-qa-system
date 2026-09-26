@@ -57,16 +57,31 @@ def md5_of(path: str) -> str:
 
 
 def v3_meta_for(fname: str):
-    """从 v3 拿登记元数据（code/name/pdf_type/pdf_time 等）。"""
-    conn = pymysql.connect(host=conf.MYSQL_HOST, port=conf.MYSQL_PORT, user=conf.MYSQL_USER,
-                           password=conf.MYSQL_PASSWORD, database="df_rag_v3", charset="utf8mb4")
+    """从 MongoDB 拿登记元数据（code/name/pdf_type/pdf_time 等）。按文件名中的 art_code 匹配。"""
     try:
-        cur = conn.cursor(pymysql.cursors.DictCursor)
-        cur.execute("SELECT file_name, file_path, file_md5, file_size, code, name, pdf_type, pdf_time "
-                    "FROM pdf_files WHERE file_name = %s", (fname,))
-        return cur.fetchone()
-    finally:
-        conn.close()
+        from pymongo import MongoClient
+        # 文件名格式: 001359_AN202609101829234605.pdf → art_code=AN202609101829234605
+        base = os.path.splitext(fname)[0]
+        art_code = base.split("_")[-1] if "_" in base else ""
+        if not art_code.startswith("AN"):
+            return {}
+        mc = MongoClient("mongodb://localhost:27017/", serverSelectionTimeoutMS=3000)
+        col = mc["rag_doc_data"]["doc_url"]
+        doc = col.find_one({"art_code": art_code})
+        mc.close()
+        if doc:
+            return {
+                "file_name": fname,
+                "file_md5": None,
+                "file_size": None,
+                "code": doc.get("code"),
+                "name": doc.get("name"),
+                "pdf_type": doc.get("pdf_type"),
+                "pdf_time": str(doc.get("pdf_time") or ""),
+            }
+    except Exception:
+        pass
+    return {}
 
 
 def v4_status_by_md5(mysql: MySQLClient, md5: str):
