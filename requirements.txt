@@ -1,0 +1,52 @@
+# ===== Web 框架 =====
+fastapi
+uvicorn
+starlette
+streamlit
+
+# ===== LLM / Embedding / RAG =====
+openai
+langchain
+langchain-community
+langchain-core
+langchain-openai
+langchain-text-splitters
+sentence-transformers
+transformers
+torch
+pymilvus
+milvus-model
+redis
+rank-bm25
+ragas
+
+# ===== 数据库 =====
+pymysql
+pymongo
+mongoengine
+pandas
+numpy
+
+# ===== PDF / 文档解析 =====
+PyMuPDF          # fitz
+python-docx      # docx
+python-pptx      # pptx
+Pillow           # PIL
+opencv-python    # cv2
+rapidocr-onnxruntime
+rapidocr-paddle
+markitdown
+mineru
+jieba
+
+# ===== 数据处理 / 训练 =====
+datasets
+scikit-learn     # sklearn
+modelscope
+baostock
+
+# ===== 工具 =====
+requests
+tqdm
+pydantic
+reportlab
