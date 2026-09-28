@@ -35,7 +35,7 @@ conf = Config()
 class DocumentComplexityScorer:
     """6 分制打分器，≥2 分走 MinerU，<2 分走 markitdown"""
 
-    GARBAGE_CHARS = set("�□■▲●★☆♦♪♫‚ƒ„…†‡‰‹›€™˜™")
+    GARBAGE_CHARS = set("\ufffd\u25a1\u25a0\u25b2\u25cf\u2605\u2606\u2666\u266a\u266b\u201a\u0192\u201e\u2026\u2020\u2021\u2030\u2039\u203a\u20ac\u2122\u02dc")
     RARE_CHARS_RANGE = (0x3400, 0x4DBF)
 
     def __init__(self, file_path: str):
@@ -59,10 +59,12 @@ class DocumentComplexityScorer:
         column_widths = []
         footer_texts = []
         total_tables = 0
+        garbage_count = 0
 
         for page in doc:
             text = page.get_text()
             total_text_chars += len(text.strip())
+            garbage_count += self._count_garbage(text)
             img_list = page.get_image_info()
             total_images += len(img_list)
             blocks = page.get_text("blocks")
@@ -84,7 +86,6 @@ class DocumentComplexityScorer:
 
         doc.close()
 
-        avg_images_per_page = total_images / max(self.page_count, 1)
         avg_chars_per_page = total_text_chars / max(self.page_count, 1)
 
         # 1. 只要有图片就走 MinerU
@@ -100,13 +101,8 @@ class DocumentComplexityScorer:
             features["multi_column"] = variance > (avg_width * 0.3) ** 2
         else:
             features["multi_column"] = False
-        # 5. 乱码生僻字比例
-        doc = fitz.open(self.file_path)
-        sample_text = ""
-        for i in range(min(10, doc.page_count)):
-            sample_text += doc[i].get_text()
-        doc.close()
-        features["high_garbage"] = self._garbage_ratio(sample_text) > 0.05
+        # 5. 乱码生僻字比例（全量统计，已在循环中累加）
+        features["high_garbage"] = garbage_count / max(total_text_chars, 1) > 0.05
         # 6. 页眉页脚干扰
         if len(footer_texts) > 3:
             from collections import Counter
@@ -120,19 +116,17 @@ class DocumentComplexityScorer:
         return score, features
 
     @staticmethod
-    def _garbage_ratio(text: str) -> float:
-        """静态方法：计算乱码生僻字比例"""
-        if not text:
-            return 0.0
-        GARBAGE_CHARS = set("�□■▲●★☆♦♪♫‚ƒ„…†‡‰‹›€™˜™")
-        RARE_CHARS_RANGE = (0x3400, 0x4DBF)
-        garbage_count = 0
+    def _count_garbage(text: str) -> int:
+        """数文本中乱码/生僻字个数"""
+        GARBAGE_CHARS = DocumentComplexityScorer.GARBAGE_CHARS
+        RARE_CHARS_RANGE = DocumentComplexityScorer.RARE_CHARS_RANGE
+        cnt = 0
         for ch in text:
             if ch in GARBAGE_CHARS:
-                garbage_count += 1
+                cnt += 1
             elif RARE_CHARS_RANGE[0] <= ord(ch) <= RARE_CHARS_RANGE[1]:
-                garbage_count += 1
-        return garbage_count / len(text)
+                cnt += 1
+        return cnt
 
 
 # ==================== 解析器：MinerU / markitdown ====================

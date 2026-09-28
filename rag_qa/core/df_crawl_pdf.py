@@ -5,7 +5,6 @@
 
 方案：Firefox 配置了 pdfjs.disabled=true，打开 PDF URL 时自动下载到 Downloads 目录。
 用 subprocess.Popen 逐个打开 URL，检测下载完成后移动文件到 pdf_data。
-完全不需要 pyautogui 模拟键盘。
 
 PDF 直链规律：https://pdf.dfcfw.com/pdf/H2_{art_code}_1.pdf
 （Python 直连被 WAF 按 TLS 指纹封禁，但真实浏览器 Firefox 不受影响）
@@ -20,9 +19,6 @@ PDF 直链规律：https://pdf.dfcfw.com/pdf/H2_{art_code}_1.pdf
     3. 失败保持 is_used=False，下次重跑自动重试
 
 依赖：mongoengine
-用法：
-    python df_crawl_pdf.py                  # 全量下载
-    python df_crawl_pdf.py --limit 3        # 只处理前 3 条（测试）
 """
 import os
 import time

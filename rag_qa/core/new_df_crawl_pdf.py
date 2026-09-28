@@ -4,21 +4,14 @@
 并发下载公告 PDF（直连 requests 版本）
 
 特点：
-  - 直连 requests，不走 Firefox，速度快 50 倍
   - 低并发 + UA 轮换 + 随机间隔，避免触发反爬
   - 断点续传：已下载的自动跳过
   - 失败自动重试，失败记录日志
   - 实时进度显示
-
-用法：
-    python new_df_crawl_pdf.py                # 全量下载
-    python new_df_crawl_pdf.py --limit 100    # 只跑前100条
-    python new_df_crawl_pdf.py --workers 5    # 指定并发数（默认5）
 """
 import os
 import time
 import random
-import argparse
 import logging
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -178,8 +171,4 @@ def main(limit=None, workers=MAX_WORKERS):
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="并发下载公告 PDF（直连版）")
-    parser.add_argument("--limit", type=int, default=None, help="最多处理多少条")
-    parser.add_argument("--workers", type=int, default=MAX_WORKERS, help="并发数（默认5）")
-    args = parser.parse_args()
-    main(limit=args.limit, workers=args.workers)
+    main()

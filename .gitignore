@@ -43,6 +43,7 @@ bge-reranker-large.tar
 # ---- 交接文档（不公开） ----
 文档解析入库模块交接文档*.md
 文档解析模块*.md
+HANDOVER.md
 
 pdf_data_v1/
 *.zip

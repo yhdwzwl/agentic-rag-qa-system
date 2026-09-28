@@ -97,12 +97,3 @@ class MongoDBClient:
             self.logger.error(f"关闭连接失败: {e}")
 
 
-if __name__ == '__main__':
-    # 实例化新的客户端
-    mongo_client = MongoDBClient()
-    #
-    # 这里的调用方式和之前完全一样，主程序不需要改动
-    mongo_client.insert_data('../data/JP学科知识问答.csv')
-
-    # 测试一下查询
-    print(mongo_client.fetch_answer("关联子查询的执行顺序是什么"))
