@@ -272,7 +272,8 @@ class DocumentParser:
         self._validate_images()
 
     def _calc_garbage_ratio(self, text: str) -> float:
-        return DocumentComplexityScorer._garbage_ratio(text)
+        garbage_count = DocumentComplexityScorer._count_garbage(text)
+        return garbage_count / max(len(text), 1)
 
     def _validate_tables(self):
         """检测 Markdown 表格是否完整（| 行是否成对）"""
