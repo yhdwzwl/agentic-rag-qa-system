@@ -114,6 +114,11 @@ def run_one(pdf_path: str, mysql: MySQLClient, vs: VectorStore):
 
     rep = check_file(file_id, mysql_client=mysql)
     if not rep.ok:
+        # 先标 failed 再抛异常：质检门失败的文件必须留可重跑状态。
+        # 首次入库时 main 的 existing 为 None（run_one 之前查不到），
+        # 不在这里标 failed 会停留在 done 状态、被断点续跑永久跳过。
+        mysql.update_pdf_status(file_id, "failed",
+                                error_msg=f"质检门未通过: {rep.errors}"[:500])
         raise RuntimeError(f"质检门未通过: {rep.errors}")
 
     elapsed = time.time() - t0
