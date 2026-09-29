@@ -438,8 +438,8 @@ class StructureAwareSplitter:
 
         # 表格去重：同一张表的 HTML/Markdown 多格式只保留一份（单元格指纹相似 >0.9 判定同表）
         all_children = self._dedup_table_chunks(all_children)
-        # 短子块过滤：去空白后 <=4 字符的碎片（封面标题残片/孤立短词）不入库，避免污染检索
-        all_children = [d for d in all_children if len(d.page_content.strip()) > 4]
+        # 短子块过滤：去空白后 <10 字符的碎片（封面标题残片/孤立短词/单位标注）不入库，避免污染检索
+        all_children = [d for d in all_children if len(d.page_content.strip()) >= 10]
 
         for doc in all_children:
             doc.metadata.update(metadata)
