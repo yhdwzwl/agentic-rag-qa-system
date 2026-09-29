@@ -46,6 +46,103 @@ class MySQLClient:
                 INDEX idx_status (status)
             ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='标准问答对表（人工校对）'
         """)
+        # pdf_files PDF文件信息表
+        self.cursor.execute("""
+            CREATE TABLE IF NOT EXISTS pdf_files (
+                id INT AUTO_INCREMENT PRIMARY KEY COMMENT '主键',
+                file_name VARCHAR(500) NOT NULL COMMENT '文件名',
+                file_path TEXT COMMENT '文件路径',
+                file_md5 VARCHAR(32) COMMENT '文件MD5',
+                file_size BIGINT COMMENT '文件大小(字节)',
+                code VARCHAR(20) COMMENT '股票代码',
+                name VARCHAR(200) COMMENT '股票名称',
+                pdf_type VARCHAR(50) COMMENT '文档类型',
+                pdf_time VARCHAR(50) COMMENT '文档时间',
+                status VARCHAR(20) DEFAULT 'pending' COMMENT '处理状态：pending/processing/indexed/failed',
+                parse_method VARCHAR(50) COMMENT '解析方法',
+                complexity_score INT COMMENT '复杂度打分',
+                parent_count INT DEFAULT 0 COMMENT '父块数',
+                child_count INT DEFAULT 0 COMMENT '子块数',
+                error_msg TEXT COMMENT '错误信息',
+                created_time DATETIME DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间',
+                updated_time DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP COMMENT '更新时间',
+                UNIQUE KEY file_md5 (file_md5),
+                KEY idx_status (status),
+                KEY idx_md5 (file_md5)
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci COMMENT='PDF文件信息表'
+        """)
+        # parent_docs 父文档表（含入库时间）
+        self.cursor.execute("""
+            CREATE TABLE IF NOT EXISTS parent_docs (
+                id INT AUTO_INCREMENT PRIMARY KEY COMMENT '主键',
+                file_id INT COMMENT '关联pdf_files.id',
+                file_name VARCHAR(500) COMMENT '文件名',
+                file_path TEXT COMMENT '文件路径',
+                pdf_type VARCHAR(50) COMMENT '文档类型',
+                code VARCHAR(20) COMMENT '股票代码',
+                name VARCHAR(200) COMMENT '股票名称',
+                pdf_time VARCHAR(50) COMMENT '文档时间',
+                doc_type VARCHAR(50) COMMENT '文档细分类型',
+                parse_method VARCHAR(50) COMMENT '解析方法',
+                complexity_score INT COMMENT '复杂度打分',
+                parent_content MEDIUMTEXT COMMENT '父块完整内容',
+                heading VARCHAR(500) COMMENT '标题',
+                heading_level INT COMMENT '标题层级',
+                heading_path TEXT COMMENT '标题路径',
+                created_time DATETIME DEFAULT CURRENT_TIMESTAMP COMMENT '入库时间',
+                KEY idx_file_id (file_id)
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci COMMENT='父文档表'
+        """)
+        # child_chunks 子块表（含入库时间）
+        self.cursor.execute("""
+            CREATE TABLE IF NOT EXISTS child_chunks (
+                id INT AUTO_INCREMENT PRIMARY KEY COMMENT '主键',
+                parent_id INT COMMENT '关联parent_docs.id',
+                chunk_index INT COMMENT '父块内序号',
+                content MEDIUMTEXT COMMENT '子块内容',
+                char_count INT COMMENT '字符数',
+                chunk_type VARCHAR(50) COMMENT '类型：text/table',
+                is_table TINYINT DEFAULT 0 COMMENT '是否表格',
+                has_number TINYINT DEFAULT 0 COMMENT '是否含数字',
+                heading VARCHAR(500) COMMENT '标题',
+                heading_level INT COMMENT '标题层级',
+                heading_path TEXT COMMENT '标题路径',
+                page_no INT COMMENT '页码',
+                image_ids TEXT COMMENT '关联图片ID列表(JSON)',
+                created_time DATETIME DEFAULT CURRENT_TIMESTAMP COMMENT '入库时间',
+                KEY idx_parent_id (parent_id)
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci COMMENT='子块表'
+        """)
+        # doc_images 文档图片表（含入库时间）
+        self.cursor.execute("""
+            CREATE TABLE IF NOT EXISTS doc_images (
+                id INT AUTO_INCREMENT PRIMARY KEY COMMENT '主键',
+                file_id INT COMMENT '关联pdf_files.id',
+                parent_id INT COMMENT '关联parent_docs.id',
+                chunk_id INT COMMENT '关联child_chunks.id',
+                chunk_index INT COMMENT '子块序号',
+                image_data LONGTEXT COMMENT '图片base64',
+                image_type VARCHAR(50) COMMENT '图片类型',
+                image_caption TEXT COMMENT '图片标题',
+                image_size_kb FLOAT COMMENT '图片大小KB',
+                created_time DATETIME DEFAULT CURRENT_TIMESTAMP COMMENT '入库时间',
+                KEY idx_file_id (file_id),
+                KEY idx_chunk_id (chunk_id)
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci COMMENT='文档图片表'
+        """)
+        # doc_status 文档状态表
+        self.cursor.execute("""
+            CREATE TABLE IF NOT EXISTS doc_status (
+                id INT AUTO_INCREMENT PRIMARY KEY COMMENT '主键',
+                parent_id INT COMMENT '关联parent_docs.id',
+                file_path TEXT COMMENT '文件路径',
+                status VARCHAR(20) COMMENT '处理状态：pending/processing/indexed/failed',
+                error_msg TEXT COMMENT '错误信息',
+                created_time DATETIME DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间',
+                updated_time DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP COMMENT '更新时间',
+                UNIQUE KEY parent_id (parent_id)
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci COMMENT='文档状态表'
+        """)
         self.connection.commit()
         self.logger.info("MySQL 表结构检查完成")
 
