@@ -1178,24 +1178,6 @@ def warmup_mineru():
         raise RuntimeError(f"MinerU 预热失败，终止流程：{e}") from e
 
 
-def _detect_cover_text(file_path: str, threshold: int = 300) -> str:
-    """封面页检测：PDF 第一页去空白字符数 < threshold 视为封面页（标题+图片为主）。
-    返回第一页完整文本（含换行）；非封面页返回空串。"""
-    try:
-        doc = fitz.open(file_path)
-        if doc.page_count == 0:
-            doc.close()
-            return ""
-        page0 = doc[0]
-        t = page0.get_text()
-        doc.close()
-        if t and len(re.sub(r"\s", "", t)) < threshold:
-            return t
-    except Exception as e:
-        logger.warning(f"[封面检测] 第一页读取失败: {e}")
-    return ""
-
-
 def process_pdf(file_path: str) -> List[Document]:
     """处理单个 PDF 文件，返回子块列表"""
     logger.info(f"处理文件: {file_path}")
