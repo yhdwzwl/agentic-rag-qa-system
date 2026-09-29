@@ -296,27 +296,42 @@ class DocumentParser:
         return garbage_count / max(len(text), 1)
 
     def _validate_tables(self):
-        """检测 Markdown 表格是否完整（| 行是否成对）"""
-        lines = self.md_content.split("\n")
-        table_lines = [i for i, l in enumerate(lines) if l.strip().startswith("|")]
-        if not table_lines:
-            return
-        has_separator = any("---" in lines[i] for i in table_lines)
-        if not has_separator:
-            logger.warning("[校验] 表格缺少分隔行，降级为纯文本")
-            self._strip_incomplete_tables()
+        """检测 Markdown 表格是否完整（| 行是否成对）。
 
-    def _strip_incomplete_tables(self):
-        """移除不完整的表格行，降级为纯文本"""
+        按"表格块"（连续以 | 开头的行）逐块判断：块内无 --- 分隔行的判定为异常表格，
+        仅该块降级为纯文本；正常表格块（含分隔行）保留原样，避免真表格+伪表格混合时整篇误降级。
+        """
+        lines = self.md_content.split("\n")
+        # 1. 找所有表格块：连续以 | 开头的行构成一块
+        blocks = []
+        i, n = 0, len(lines)
+        while i < n:
+            if lines[i].strip().startswith("|"):
+                j = i
+                while j < n and lines[j].strip().startswith("|"):
+                    j += 1
+                blocks.append((i, j))  # [i, j) 是一个表格块
+                i = j
+            else:
+                i += 1
+        if not blocks:
+            return
+        # 2. 块内无 --- 分隔行的判定为异常表格，仅降级这些块
+        bad_blocks = [b for b in blocks if not any("---" in lines[k] for k in range(b[0], b[1]))]
+        if bad_blocks:
+            logger.warning(f"[校验] {len(bad_blocks)} 个表格缺少分隔行，降级为纯文本")
+            self._strip_incomplete_tables(bad_blocks)
+
+    def _strip_incomplete_tables(self, blocks):
+        """将异常表格块降级为纯文本（去 | 和分隔行），块外内容原样保留"""
         lines = self.md_content.split("\n")
         cleaned = []
-        for line in lines:
-            stripped = line.strip()
-            if stripped.startswith("|"):
+        for idx, line in enumerate(lines):
+            if any(s <= idx < e for s, e in blocks):
+                stripped = line.strip()
                 if "---" in stripped:
-                    continue
-                content = stripped.replace("|", " ").strip()
-                cleaned.append(content)
+                    continue  # 分隔行丢弃
+                cleaned.append(stripped.replace("|", " ").strip())
             else:
                 cleaned.append(line)
         self.md_content = "\n".join(cleaned)
