@@ -41,6 +41,7 @@ class DocumentComplexityScorer:
     def __init__(self, file_path: str):
         self.file_path = file_path
         self.page_count = 0
+        self.page_texts = []  # 每页原始文本，供封面判定复用，避免重新打开 PDF
 
     def score(self) -> Tuple[int, Dict[str, bool]]:
         ext = os.path.splitext(self.file_path)[1].lower()
@@ -64,6 +65,7 @@ class DocumentComplexityScorer:
 
         for page_idx, page in enumerate(doc):
             text = page.get_text()
+            self.page_texts.append(text)
             total_text_chars += len(text.strip())
             garbage_count += self._count_garbage(text)
             # 图片统计：过滤装饰性小图（像素短边 <20px，或显示面积 < 页面 1%），
@@ -1221,10 +1223,13 @@ def process_pdf(file_path: str) -> List[Document]:
         "complexity_score": score,
         "processed_at": datetime.now().isoformat()
     }
-    cover_text = _detect_cover_text(file_path)
-    if cover_text:
-        cover_len = len(re.sub(r"\s", "", cover_text))
-        logger.info(f"[封面检测] 第一页去空白 {cover_len} 字符 < 300，作为封面页整页保护")
+    cover_text = ""
+    if scorer.page_texts:
+        first_text = scorer.page_texts[0]
+        first_len = len(re.sub(r"\s", "", first_text))
+        if first_len < 300:
+            cover_text = first_text
+            logger.info(f"[封面检测] 第一页去空白 {first_len} 字符 < 300，作为封面页整页保护")
     chunks = splitter.split(md_text, metadata, cover_text=cover_text)
     # 子块→页码反查（解析器已构建 page_signatures；纯文本 markitdown 走 PDF 文本层）
     located = 0
