@@ -60,13 +60,26 @@ class DocumentComplexityScorer:
         footer_texts = []
         total_tables = 0
         garbage_count = 0
+        tables_found = False
 
-        for page in doc:
+        for page_idx, page in enumerate(doc):
             text = page.get_text()
             total_text_chars += len(text.strip())
             garbage_count += self._count_garbage(text)
-            img_list = page.get_image_info()
-            total_images += len(img_list)
+            # 图片统计：过滤装饰性小图（像素短边 <20px，或显示面积 < 页面 1%），
+            # 避免页眉 logo/公司印章让 dense_images 误命中，把所有文档都推向 MinerU
+            page_area = page.rect.width * page.rect.height
+            for img in page.get_image_info():
+                w = img.get("width", 0) or 0
+                h = img.get("height", 0) or 0
+                if min(w, h) < 20:
+                    continue
+                bbox = img.get("bbox")
+                if bbox and len(bbox) == 4 and page_area > 0:
+                    area = (bbox[2] - bbox[0]) * (bbox[3] - bbox[1])
+                    if area / page_area < 0.01:
+                        continue
+                total_images += 1
             blocks = page.get_text("blocks")
             for b in blocks:
                 if b[4].strip():
@@ -76,13 +89,18 @@ class DocumentComplexityScorer:
             footer_blocks = [b for b in blocks if b[1] > footer_area and b[4].strip()]
             if footer_blocks:
                 footer_texts.append(footer_blocks[0][4].strip()[:50])
-            # 真正检测表格（PyMuPDF 1.23+ API）
-            try:
-                tables = page.find_tables()
-                if tables and tables.tables:
-                    total_tables += len(tables.tables)
-            except Exception:
-                pass
+            # 真正检测表格（PyMuPDF 1.23+ API）；跳过封面页（封面多为装饰性公司信息表），
+            # 找到第一张正文表即停止（has_tables 是布尔特征，无需统计全部表）
+            if not tables_found:
+                if page_idx == 0 and len(re.sub(r"\s", "", text)) < 300:
+                    continue
+                try:
+                    tables = page.find_tables()
+                    if tables and tables.tables:
+                        total_tables += len(tables.tables)
+                        tables_found = True
+                except Exception:
+                    pass
 
         doc.close()
 
