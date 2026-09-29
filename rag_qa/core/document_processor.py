@@ -377,8 +377,6 @@ class StructureAwareSplitter:
         self.min_child = min_child_size
         self.max_child = max_child_size
         self.overlap = int(max_child_size * overlap_ratio)
-        # 父块间重叠量：max_parent * 20%
-        self.parent_overlap = int(max_parent_size * overlap_ratio)
 
     def split(self, markdown_text: str, metadata: dict, cover_text: str = "") -> List[Document]:
         # 预处理0：封面页保护——PDF 第一页去空白 <300 字符视为封面（标题+图片为主），
@@ -561,22 +559,6 @@ class StructureAwareSplitter:
                 return m.group(0)
         return re.sub(r'\[\[TBL(\d+)\]\]', repl, text)
 
-    def _safe_tail(self, content: str, size: int) -> str:
-        """取 content 尾部 size 字符作为父块重叠尾巴，供下一父块开头重叠。
-
-        表格是完整语义单元，不随父块重叠重复入库：
-        - 重叠区域内出现的表格占位符（[[TBLn]]）一律整行剔除；
-        - 短父块（len <= size）整体作为尾巴时同样剔除其中的占位符；
-        - 多个占位符同时出现时全部剔除（旧实现只处理第一个，后续占位符
-          仍会留在尾巴里被复制到后续父块）。"""
-        if len(content) <= size:
-            tail = content
-        else:
-            tail = content[len(content) - size:]
-        if "[[TBL" in tail:
-            lines = tail.split("\n")
-            tail = "\n".join(l for l in lines if "[[TBL" not in l)
-        return tail
     def _split_by_headings(self, text: str) -> List[Tuple[str, int, str, str]]:
         """按 #/##/### 标题层级切块，返回 (heading, level, heading_path, content)。
         heading_path 为完整标题路径，如 '一、基本情况 > 1.1 公司概况'。"""
