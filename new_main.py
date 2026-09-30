@@ -24,8 +24,8 @@ class IntegratedQASystem:
         self.mysql_client = MySQLClient()
         # 初始化Redis客户端
         self.redis_client = RedisClient()
-        # 初始化BM25搜索
-        self.bm25_search = BM25Search(self.redis_client, self.mysql_client)
+        # 初始化BM25搜索（BM25Search 只依赖 mysql_client；redis_client 为后续缓存预留）
+        self.bm25_search = BM25Search(self.mysql_client)
         try:
             # 初始化OpenAI客户端，连接DashScope API
             self.client = OpenAI(api_key=self.config.DASHSCOPE_API_KEY,
@@ -161,8 +161,8 @@ class IntegratedQASystem:
         self.logger.info(f"处理查询: '{query}' (会话ID: {session_id})")
         history = self.get_session_history(session_id) if session_id else []
 
-        # 首先尝试MySQL精确查询
-        answer, need_rag = self.bm25_search.search(query, threshold=0.85)
+        # 首先尝试MySQL精确查询（threshold=12：BM25 原始分，按库规模标定）
+        answer, need_rag = self.bm25_search.search(query, threshold=12)
 
         if answer:
             # MySQL找到精确答案，直接返回

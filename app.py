@@ -141,9 +141,11 @@ async def query(request: QueryRequest):
             "processing_time": time.time() - start_time
         }
 
-    # 判断是否需要流式处理（基于 need_rag）
-    answer, need_rag = qa_system.bm25_search.search(request.query, threshold=0.85)
-    if need_rag:
+    # 判断是否需要流式处理（基于 need_rag），threshold=12：BM25 原始分阈值
+    # 注意：need_rag 是状态码字符串，不能直接当布尔用——"bm25_hit" 也是 truthy，
+    #       否则命中缓存也会被误判为"需要 RAG"
+    answer, need_rag = qa_system.bm25_search.search(request.query, threshold=12)
+    if need_rag in ("fallback", "error", "invalid"):
         # 需要 RAG 和 LLM 处理，返回流式响应提示
         return {
             "answer": "请使用WebSocket接口获取流式响应",
@@ -152,7 +154,7 @@ async def query(request: QueryRequest):
             "processing_time": time.time() - start_time
         }
 
-    # 非流式查询，直接返回 BM25 检索的答案
+    # bm25_hit：非流式查询，直接返回 BM25 检索的答案
     return {
         "answer": answer,
         "is_streaming": False,
