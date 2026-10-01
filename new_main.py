@@ -2,6 +2,8 @@
 from mysql_qa import MySQLClient, RedisClient, BM25Search
 # 导入RAG系统组件
 from rag_qa import VectorStore, RAGSystem
+# [12] 三层记忆模块（user_id 写死 10 个 uuid，见 memory_manager.DUMMY_USER_IDS）
+from rag_qa.core.memory_manager import MemoryManager
 # 导入配置和日志
 from base import logger, Config
 # 导入OpenAI客户端，用于DashScope API
@@ -39,6 +41,13 @@ class IntegratedQASystem:
         self.rag_system = RAGSystem(self.vector_store, self.call_dashscope)
         # 初始化对话历史表
         self.init_conversation_table()
+        # [12] 三层记忆模块初始化（失败降级 None，记忆功能不启用，不影响主流程）
+        self.memory_manager = None
+        try:
+            self.memory_manager = MemoryManager(self.redis_client, self.mysql_client)
+            logger.info("三层记忆模块初始化成功")
+        except Exception as e:
+            logger.warning(f"三层记忆模块初始化失败，记忆功能降级（不影响主流程）: {e}")
 
     def init_conversation_table(self):
         """初始化MySQL中的conversations表，用于存储对话历史"""
@@ -88,15 +97,16 @@ class IntegratedQASystem:
             return f"错误：LLM调用失败 - {e}"
 
     def _fetch_recent_history(self, session_id: str) -> list:
-        """获取最近5轮对话历史"""
+        """获取最近 N 轮对话历史（[12] 窗口记忆，轮数=conf.WINDOW_ROUNDS，默认3）"""
         try:
+            limit = self.config.WINDOW_ROUNDS
             self.mysql_client.cursor.execute("""
                 SELECT question, answer
                 FROM conversations
                 WHERE session_id = %s
                 ORDER BY timestamp DESC
                 LIMIT %s
-            """, (session_id, 5))
+            """, (session_id, limit))
             history = [{"question": row[0], "answer": row[1]} for row in self.mysql_client.cursor.fetchall()]
             return history[::-1]
         except pymysql.MySQLError as e:
@@ -104,13 +114,14 @@ class IntegratedQASystem:
             return []
 
     def update_session_history(self, session_id: str, question: str, answer: str) -> list:
-        """更新会话历史到MySQL，保留最近5轮对话"""
+        """更新会话历史到MySQL，保留最近 N 轮对话（[12] 窗口记忆，轮数=conf.WINDOW_ROUNDS）"""
         try:
             self.mysql_client.cursor.execute("""
                 INSERT INTO conversations (session_id, question, answer, timestamp)
                 VALUES (%s, %s, %s, NOW())
             """, (session_id, question, answer))
             history = self._fetch_recent_history(session_id)
+            limit = self.config.WINDOW_ROUNDS
             self.mysql_client.cursor.execute("""
                 DELETE FROM conversations
                 WHERE session_id = %s AND id NOT IN (
@@ -122,7 +133,7 @@ class IntegratedQASystem:
                         LIMIT %s
                     ) AS sub
                 )
-            """, (session_id, session_id, 5))
+            """, (session_id, session_id, limit))
             self.mysql_client.connection.commit()
             self.logger.info(f"会话 {session_id} 历史更新成功")
             return history
@@ -155,11 +166,25 @@ class IntegratedQASystem:
             return False
 
     # 修改 main.py 中的 query 方法
-    def query(self, query, source_filter=None, session_id=None):
-        """查询集成系统，支持对话历史和流式输出"""
+    def query(self, query, source_filter=None, session_id=None, user_id=None):
+        """查询集成系统，支持对话历史和流式输出
+
+        [12] 三层记忆：
+        - user_id：长期记忆的用户维度（app 可传；None 时按 session_id 稳定映射到写死列表）
+        - memory_context：工作记忆+长期记忆注入文本（MemoryManager 不可用时为空串，行为与旧版一致）
+        """
         start_time = time.time()
         self.logger.info(f"处理查询: '{query}' (会话ID: {session_id})")
         history = self.get_session_history(session_id) if session_id else []
+
+        # [12] 读取工作记忆+长期记忆 → 注入文本（任何异常降级为空串，不阻断主流程）
+        memory_context = ""
+        if self.memory_manager is not None and session_id:
+            try:
+                memory_context = self.memory_manager.build_memory_context(session_id, user_id)
+            except Exception as e:
+                self.logger.warning(f"读取记忆上下文失败（降级为空串）: {e}")
+                memory_context = ""
 
         # 首先尝试MySQL精确查询（threshold=12：BM25 原始分，按库规模标定）
         answer, need_rag = self.bm25_search.search(query, threshold=12)
@@ -181,13 +206,30 @@ class IntegratedQASystem:
             collected_answer = ""
 
             # 从RAG系统获取流式输出
-            for token in self.rag_system.generate_answer(query, source_filter=source_filter, history=history):
+            for token in self.rag_system.generate_answer(query, source_filter=source_filter,
+                                                         history=history, memory_context=memory_context):
                 collected_answer += token
                 yield token, False  # 第二个参数表示这是部分答案
 
             # 完整答案收集完毕，更新会话历史
             if session_id:
                 self.update_session_history(session_id, query, collected_answer)  # 把RAG的QA更新到会话历史
+
+            # [12] 三层记忆：流式结束后回写（matched_companies 来自分类器现成实体识别；
+            # 记忆更新在流式之后，不增加首 token 延迟；任何异常只记日志不影响主流程）
+            if self.memory_manager is not None and session_id:
+                try:
+                    matched = self.rag_system.last_query_result.get("matched_companies", []) or []
+                    self.memory_manager.update_memory(
+                        session_key=session_id,
+                        user_id=user_id,
+                        question=query,
+                        answer=collected_answer,
+                        matched_companies=matched,
+                        source_filter=source_filter,
+                    )
+                except Exception as e:
+                    self.logger.warning(f"记忆更新失败（不影响主流程）: {e}")
 
             processing_time = time.time() - start_time
             self.logger.info(f"查询处理耗时 {processing_time:.2f}秒")

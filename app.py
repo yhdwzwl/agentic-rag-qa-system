@@ -59,6 +59,8 @@ class QueryRequest(BaseModel):
     query: str
     source_filter: Optional[str] = None
     session_id: Optional[str] = None
+    # [12] 三层记忆：长期记忆的用户维度（前端可传稳定 id；None 时按 session_id 稳定映射到写死列表）
+    user_id: Optional[str] = None
 
 
 # 定义响应模型
@@ -177,6 +179,8 @@ async def websocket_endpoint(websocket: WebSocket):
             query = request_data.get("query")
             source_filter = request_data.get("source_filter")
             session_id = request_data.get("session_id", str(uuid.uuid4()))
+            # [12] 三层记忆：长期记忆的用户维度（None 时后端按 session_id 稳定映射到写死列表）
+            user_id = request_data.get("user_id")
 
             start_time = time.time()
 
@@ -206,7 +210,8 @@ async def websocket_endpoint(websocket: WebSocket):
 
             # 调用QA系统进行查询，流式返回结果
             collected_answer = ""
-            for token, is_complete in qa_system.query(query, source_filter=source_filter, session_id=session_id):
+            for token, is_complete in qa_system.query(query, source_filter=source_filter,
+                                                      session_id=session_id, user_id=user_id):
                 collected_answer += token
 
                 if is_complete and not collected_answer:
