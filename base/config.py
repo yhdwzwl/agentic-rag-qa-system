@@ -42,6 +42,8 @@ class Config:
         self.REDIS_VECTOR_CACHE_FORMAL_TTL = self.config.getint('redis_vector_cache', 'formal_ttl', fallback=604800)
         self.REDIS_VECTOR_CACHE_HOT_THRESHOLD = self.config.getint('redis_vector_cache', 'hot_threshold', fallback=3)
         self.REDIS_VECTOR_CACHE_MAX_SIZE = self.config.getint('redis_vector_cache', 'max_cache_size', fallback=100000)
+        self.CACHE_ENABLED = self.config.getboolean('redis_vector_cache', 'cache_enabled', fallback=True)
+        self.SLIDING_TTL_ENABLED = self.config.getboolean('redis_vector_cache', 'sliding_ttl_enabled', fallback=True)
 
         # Milvus 閰嶇疆
         # Milvus 涓绘満鍦板潃

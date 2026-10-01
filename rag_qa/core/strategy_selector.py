@@ -4,6 +4,52 @@ from langchain.prompts import PromptTemplate
 from base import logger, Config
 # 导入 OpenAI
 from openai import OpenAI
+# 导入 re，用于策略名清洗（去标点/空白后做归一化匹配）
+import re
+
+# 四种规范策略名
+STRATEGY_DIRECT = "直接检索"
+STRATEGY_HYDE = "假设问题检索"
+STRATEGY_SUBQUERY = "子查询检索"
+STRATEGY_BACKTRACKING = "回溯问题检索"
+STRATEGY_NAMES = (STRATEGY_DIRECT, STRATEGY_HYDE, STRATEGY_SUBQUERY, STRATEGY_BACKTRACKING)
+
+# LLM 策略输出归一化映射：键为清洗后（小写、去空白/标点）的别名，值为规范策略名。
+# 覆盖常见变体：带括号/标点/英文名/简写，保证"实际执行策略"与"评估记录策略"口径一致。
+STRATEGY_ALIASES = {
+    # 直接检索
+    "直接检索": STRATEGY_DIRECT,
+    "直接搜索": STRATEGY_DIRECT,
+    "直接查询": STRATEGY_DIRECT,
+    "直接": STRATEGY_DIRECT,
+    "direct": STRATEGY_DIRECT,
+    "directretrieval": STRATEGY_DIRECT,
+    "直接检索策略": STRATEGY_DIRECT,
+    # 假设问题检索（HyDE）
+    "假设问题检索": STRATEGY_HYDE,
+    "假设问题检索hyde": STRATEGY_HYDE,
+    "假设问题": STRATEGY_HYDE,
+    "假设答案检索": STRATEGY_HYDE,
+    "假设答案": STRATEGY_HYDE,
+    "hyde": STRATEGY_HYDE,
+    "hyde检索": STRATEGY_HYDE,
+    "hypotheticaldocumentembeddings": STRATEGY_HYDE,
+    # 子查询检索
+    "子查询检索": STRATEGY_SUBQUERY,
+    "子查询": STRATEGY_SUBQUERY,
+    "子问题检索": STRATEGY_SUBQUERY,
+    "子问题": STRATEGY_SUBQUERY,
+    "subquery": STRATEGY_SUBQUERY,
+    "subqueries": STRATEGY_SUBQUERY,
+    "subquery检索": STRATEGY_SUBQUERY,
+    # 回溯问题检索
+    "回溯问题检索": STRATEGY_BACKTRACKING,
+    "回溯问题": STRATEGY_BACKTRACKING,
+    "回溯检索": STRATEGY_BACKTRACKING,
+    "回溯": STRATEGY_BACKTRACKING,
+    "backtracking": STRATEGY_BACKTRACKING,
+    "backtracking检索": STRATEGY_BACKTRACKING,
+}
 
 
 class StrategySelector:
@@ -51,8 +97,8 @@ class StrategySelector:
                     * 查询：某某公司这次减持了多少股份？
                         * 策略：直接检索
             2.  **假设问题检索（HyDE）：**
-                * 描述：使用 LLM 生成一个假设的答案，然后基于假设答案进行检索。
-                * 适用场景：适用于查询较为抽象，直接检索效果不佳的问题，例如：
+                * 描述：先基于查询生成一段假设答案，再用假设答案做检索，弥补 query 与文档的措辞鸿沟。
+                * 适用场景：适用于查询较为抽象、直接检索效果不佳的问题，例如：
                     * 示例：
                         * 查询：ST股票一般有什么风险？
                         * 策略：假设问题检索
@@ -63,23 +109,48 @@ class StrategySelector:
                         * 查询：比较宁德时代和比亚迪的融资规模和减持情况。
                         * 策略：子查询检索
             4.  **回溯问题检索：**
-                * 描述：将复杂的用户查询转化为更基础、更易于检索的问题，然后进行检索。
+                * 描述：查询带有指代或上下文依赖（如"它"、"该公司"），需要结合对话历史改写成更基础、可独立检索的问题后再检索。
                 * 适用场景：适用于查询较为复杂，有指代或上下文依赖，需要简化后才能有效检索的问题，例如：
                     * 示例：
                         * 查询：它上次减持之后，股价现在怎么样了？
                         * 策略：回溯问题检索
 
-            根据用户查询 {query}，直接返回最适合的策略名称，例如 "直接检索"。不要输出任何分析过程或其他内容。
+            根据用户查询 {query}，只输出以下四个策略名称之一："直接检索"、"假设问题检索"、"子查询检索"、"回溯问题检索"。
+            不要输出标点、括号、解释、多余文字或换行，只输出策略名称本身。
             """
             ,
             input_variables=["query"],
         )
 
+    def normalize(self, strategy):
+        """
+        把 LLM 返回的策略文本归一化为四种规范策略名之一。
+        - 清洗：小写、去空白/标点/括号，先精确匹配，再按别名长度降序做包含匹配
+          （长别名优先，避免"子查询"先匹配到"子问题"这类短串误判）
+        - 无法识别（空/乱码/无关输出）→ 回退"直接检索"并记录 warning，保证主流程不崩
+        :param strategy: LLM 原始输出
+        :return: 规范策略名（STRATEGY_NAMES 之一）
+        """
+        if not strategy:
+            logger.warning("策略选择返回空，回退直接检索")
+            return STRATEGY_DIRECT
+        cleaned = re.sub(r'[\s\-_（）()\[\]【】。.!！,，、;；:：\'"“”‘’]', '', str(strategy).strip().lower())
+        if cleaned in STRATEGY_ALIASES:
+            return STRATEGY_ALIASES[cleaned]
+        # 包含匹配：按别名长度降序，优先长别名
+        for alias in sorted(STRATEGY_ALIASES, key=len, reverse=True):
+            if alias and (alias in cleaned or cleaned in alias):
+                return STRATEGY_ALIASES[alias]
+        logger.warning(f"策略名无法识别: {strategy!r}，回退直接检索")
+        return STRATEGY_DIRECT
+
     #   定义方法，选择检索策略
     def select_strategy(self, query):
         #   调用 LLM 获取检索策略
-        strategy = self.call_dashscope(self.strategy_prompt_template.format(query=query)).strip()
-        logger.info(f"为查询 '{query}' 选择的检索策略：{strategy}")
+        raw_strategy = self.call_dashscope(self.strategy_prompt_template.format(query=query)).strip()
+        #   归一化为规范策略名（无法识别自动回退"直接检索"）
+        strategy = self.normalize(raw_strategy)
+        logger.info(f"为查询 '{query}' 选择的检索策略：{raw_strategy!r} → {strategy}")
         return strategy
 
 

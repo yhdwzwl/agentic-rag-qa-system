@@ -13,6 +13,27 @@ conf = Config()
 PRECISE_QUERY_WORDS = ["多少", "几", "分别", "具体", "明细", "逐项",
                        "列出", "到底", "数值", "金额是", "具体数字", "具体金额"]
 
+# —— [5] 检索策略选择：直接检索的规则判定（用户拍板：直接检索不需要策略、不需要改写）——
+# 否定信号：命中任一 → 判定为"非直接检索"（走 LLM 选策略 + 改写）
+DIRECT_QUERY_NEGATIVE_WORDS = [
+    # 抽象/分析类（需要假设答案或深度改写）
+    "为什么", "原因", "怎么看", "如何看", "分析", "解读", "风险", "趋势", "展望",
+    "预测", "影响", "意味着", "说明什么", "会怎样", "后市", "怎么走", "值得",
+    # 比较/选择类（多为多实体多维度，需拆子查询）
+    "比较", "对比", "vs", "哪个", "谁更", "孰优", "差异", "区别", "不同",
+    # 指代类（依赖上下文，需回溯改写）
+    "它", "这个公司", "这家公司", "该公司", "上述", "前者", "后者", "那边",
+    # 汇总/时间跨度类（需跨多条公告汇总，直接检索单块易漏）
+    "今年以来", "最近几年", "历年", "累计", "总共", "合计", "汇总", "整体情况", "所有年份",
+]
+# 肯定信号：无公司实体命中时，再要求命中强事实词才算"直接检索"
+DIRECT_QUERY_FACT_WORDS = [
+    "多少", "几", "哪天", "何时", "什么时间", "日期", "金额", "数量", "比例",
+    "价格", "股价", "市值", "持股", "减持", "增持", "融资", "回购", "分红",
+    "质押", "解禁", "收购", "中标", "业绩", "营收", "净利润", "毛利率", "负债",
+    "现金流", "评级", "公告", "披露", "发布", "派息", "定增", "重组", "股数",
+]
+
 
 #   定义 RAGSystem 类，封装 RAG 系统的核心逻辑
 class RAGSystem:
@@ -31,14 +52,18 @@ class RAGSystem:
         )
         #   初始化策略选择器
         self.strategy_selector = StrategySelector()
-        # 初始化Redis向量缓存
-        try:
-            from .redis_vector_cache import RedisVectorCache
-            self.vector_cache = RedisVectorCache()
-            logger.info("Redis向量缓存初始化成功")
-        except Exception as e:
-            logger.warning(f"Redis向量缓存初始化失败，将跳过缓存: {e}")
-            self.vector_cache = None
+        # 初始化Redis向量缓存（cache_enabled 总开关；Redis 不可用自动降级跳过）
+        self.vector_cache = None
+        if conf.CACHE_ENABLED:
+            try:
+                from .redis_vector_cache import RedisVectorCache
+                self.vector_cache = RedisVectorCache()
+                logger.info("Redis向量缓存初始化成功")
+            except Exception as e:
+                logger.warning(f"Redis向量缓存初始化失败，将跳过缓存: {e}")
+                self.vector_cache = None
+        else:
+            logger.info("Redis向量缓存已禁用 (cache_enabled=false)")
         # 最大8192字符
         self.max_prompt_length = 16384
 
@@ -52,6 +77,7 @@ class RAGSystem:
             "retrieved_scores": [],
             "source_metas": [],
             "retrieval_strategy": "",
+            "strategy_select_time": 0.0,
             "rewritten_query": "",
             "classify_time": 0.0,
             "rewrite_time": 0.0,
@@ -67,7 +93,7 @@ class RAGSystem:
         }
 
     #   定义私有方法，使用假设文档进行检索（HyDE）
-    def _retrieve_with_hyde(self, query):
+    def _retrieve_with_hyde(self, query, source_filter=None):
         logger.info(f"使用 HyDE 策略进行检索 (查询: '{query}')")
         #   获取假设问题生成的 Prompt 模板
         hyde_prompt_template = RAGPrompts.hyde_prompt()  # 使用 template 后缀区分
@@ -79,14 +105,14 @@ class RAGSystem:
             #   使用假设答案进行检索，并返回检索结果
             #   注意：HyDE 通常只用于生成检索向量，不一定需要 rerank 这一步，但这里复用了
             return self.vector_store.hybrid_search_with_rerank(
-                hypo_answer, k=conf.RETRIEVAL_K  # 使用 K 而非 M
+                hypo_answer, k=conf.RETRIEVAL_K, source_filter=source_filter  # 使用 K 而非 M
             )
         except Exception as e:
             logger.error(f"HyDE 策略执行失败: {e}")
             return []
 
     #   定义私有方法，使用子查询进行检索
-    def _retrieve_with_subqueries(self, query):
+    def _retrieve_with_subqueries(self, query, source_filter=None):
         """
         1.获取提示词
         2、调用大模型得到子问题
@@ -115,7 +141,7 @@ class RAGSystem:
                 #   使用子查询进行检索，并将结果添加到列表中
                 #   这里对每个子查询都执行了 hybrid search + rerank，开销可能较大
                 docs = self.vector_store.hybrid_search_with_rerank(
-                    sub_q, k=conf.RETRIEVAL_K  # 使用 K
+                    sub_q, k=conf.RETRIEVAL_K, source_filter=source_filter  # 使用 K
                 )
                 all_docs.extend(docs)
                 logger.info(f"子查询 '{sub_q}' 检索到 {len(docs)} 个文档")
@@ -134,26 +160,66 @@ class RAGSystem:
             logger.error(f"子查询策略执行失败: {e}")
             return []
 
-    #   定义私有方法，使用回溯问题进行检索
-    def _retrieve_with_backtracking(self, query):
+    #   定义私有方法，结合对话历史改写查询（所有进入 RAG 的 query 统一先改写）
+    def _rewrite_query(self, query, history_context):
         """
-        1、获取提示词
-        2、query改写
-        3、执行混合检索
-        :param query:
+        结合对话历史，把口语化/带指代的 query 改写成更适合公告库检索的完整问题。
+        - 无论有无历史都调用 LLM 改写：
+          · 有历史：消解指代（"它/这个"→具体公司）、补全实体
+          · 无历史（首轮提问）：跳过指代补全，直接精炼、明确化、补金融专业关键词；
+            多跳复杂问题同样受益（模板要求展开成可独立检索的表述，不丢子问题）
+        - LLM 失败或返回空：回退原 query，不影响主流程
+        :param query: 原始用户问题
+        :param history_context: 格式化的对话历史（Q:/A: 多行），可为 ""
+        :return: (rewritten_query, elapsed_time)
+        """
+        rewrite_start = time.time()
+        rewritten = query.strip()
+        if not query.strip():
+            logger.warning(f"query为空，跳过改写")
+            return rewritten, time.time() - rewrite_start
+        try:
+            rewrite_template = RAGPrompts.rewrite_prompt()
+            # 无历史时给显式占位，模板据此跳过指代补全
+            history_placeholder = history_context if history_context else "（无）"
+            prompt = rewrite_template.format(query=query, history=history_placeholder)
+            # 兼容两类 llm 接口：生成器函数（yield str）与直接返回字符串
+            raw = self.llm(prompt)
+            if isinstance(raw, str):
+                rewritten = raw.strip()
+            else:
+                parts = []
+                for token in raw:
+                    if isinstance(token, tuple):
+                        # 防御：某些流式封装 yield (role, content)，只取内容部分
+                        token = token[1] if len(token) > 1 else ""
+                    if token:
+                        parts.append(str(token))
+                rewritten = "".join(parts).strip()
+            if not rewritten:
+                logger.warning(f"query改写返回空，回退原 query (查询: '{query}')")
+                rewritten = query.strip()
+            else:
+                logger.info(f"query改写完成: '{query}' → '{rewritten}'")
+        except Exception as e:
+            logger.error(f"query改写失败，回退原 query: {e}")
+            rewritten = query.strip()
+        return rewritten, time.time() - rewrite_start
+
+    #   定义私有方法，使用回溯问题进行检索
+    def _retrieve_with_backtracking(self, query, source_filter=None):
+        """
+        回溯问题策略：query 已在 generate_answer 入口按需改写（_rewrite_query，仅非直接检索类），
+        此处直接用（已改写的）query 检索，不再二次改写（避免改变检索意图、重复消耗 LLM）。
+        :param query: 已改写（或原样）的查询
+        :param source_filter: 公告类型过滤，透传给 Milvus
         :return:
         """
         logger.info(f"使用回溯问题策略进行检索 (查询: '{query}')")
-        #   获取回溯问题生成的 Prompt 模板
-        backtrack_prompt_template = RAGPrompts.backtracking_prompt()  # 使用 template 后缀区分
         try:
-            #   调用大语言模型生成回溯问题
-            simplified_query = self.llm(backtrack_prompt_template.format(query=query))
-            simplified_query = "".join(simplified_query)
-            logger.info(f"生成的回溯问题: '{simplified_query}'")
-            #   使用回溯问题进行检索，并返回检索结果
+            # 直接用传入的（已改写的）query 执行混合检索
             return self.vector_store.hybrid_search_with_rerank(
-                simplified_query, k=conf.RETRIEVAL_K  # 使用 K
+                query, k=conf.RETRIEVAL_K, source_filter=source_filter  # 使用 K
             )
         except Exception as e:
             logger.error(f"回溯问题策略执行失败: {e}")
@@ -168,13 +234,13 @@ class RAGSystem:
         #   根据检索策略选择不同的检索方式
         ranked_sub_chunks = []  # 初始化
         if strategy == "回溯问题检索":
-            ranked_sub_chunks = self._retrieve_with_backtracking(query)
+            ranked_sub_chunks = self._retrieve_with_backtracking(query, source_filter=source_filter)
         elif strategy == "子查询检索":
-            ranked_sub_chunks = self._retrieve_with_subqueries(query)  # 返回的是唯一文档列表
+            ranked_sub_chunks = self._retrieve_with_subqueries(query, source_filter=source_filter)  # 返回的是唯一文档列表
             # 注意：子查询返回的是已 rerank 过的父文档或子块列表，后续合并逻辑可能需要调整
             # 当前实现中，子查询返回的是初步检索（可能已rerank）的块，再进行合并
         elif strategy == "假设问题检索":
-            ranked_sub_chunks = self._retrieve_with_hyde(query)
+            ranked_sub_chunks = self._retrieve_with_hyde(query, source_filter=source_filter)
         else:  # 默认或“直接检索”
             logger.info(f"使用直接检索策略 (查询: '{query}')")
             ranked_sub_chunks = self.vector_store.hybrid_search_with_rerank(
@@ -191,6 +257,31 @@ class RAGSystem:
         if not query:
             return False
         return any(w in query for w in PRECISE_QUERY_WORDS)
+
+    def _is_direct_query(self, query: str, matched_companies: list) -> bool:
+        """
+        规则判定 query 是否属于"直接检索"（意图明确的单实体事实查询）。
+        判定为"直接"需同时满足：
+        1. 不含否定信号（抽象/比较/指代/汇总跨度）
+        2. 不是多实体复合问题（matched_companies >= 2，交给子查询策略）
+        3. 有明确公司实体，或命中强事实触发词
+        保守原则：宁可少判直接（多走一次改写，改写失败会回退原 query），
+        不可误判直接（复杂问题漏改写会丢检索信号）。
+        直接检索类：不调 LLM 选策略、不改写，用原 query 直接检索。
+        """
+        if not query or not query.strip():
+            return False
+        q_lower = query.strip().lower()
+        # 1) 否定信号
+        if any(w in q_lower for w in DIRECT_QUERY_NEGATIVE_WORDS):
+            return False
+        # 2) 多实体复合问题 → 非直接（子查询）
+        if matched_companies and len(matched_companies) >= 2:
+            return False
+        # 3) 有公司实体（强信号）或命中强事实词 → 直接检索
+        if matched_companies:
+            return True
+        return any(w in q_lower for w in DIRECT_QUERY_FACT_WORDS)
 
     # #   定义方法，生成答案
     # def generate_answer(self, query, source_filter=None):
@@ -293,52 +384,122 @@ class RAGSystem:
         self.last_query_result["classify_time"] = time.time() - classify_start
         self.last_query_result["query_text"] = query
         self.last_query_result["matched_companies"] = matched_companies
+        # 每次调用先复位缓存评估字段（避免多轮对话时残留上次命中状态污染评估记录）
+        self.last_query_result["cache_hit"] = False
+        self.last_query_result["cache_level"] = ""
+        self.last_query_result["cache_time"] = 0.0
         logger.info(f"查询分类结果: {query_category} (查询: '{query}', 命中公司: {matched_companies})")
 
         # 准备上下文
         try:
             retrieval_strategy = ""
+            # 第二层缓存相关中间变量（通用知识分支保持默认：不查缓存、不回填）
+            cache_hit = False
+            q_vec = None
+            context_parts = []
+            parent_ids = []
+            rewritten_query = ""
             if query_category in ("通用知识", "通用无关"):
                 logger.info("查询为通用知识，直接调用 LLM")
+                # 不进入检索链路，无需改写；评估字段置为原 query、耗时 0
+                self.last_query_result["rewritten_query"] = query
+                self.last_query_result["rewrite_time"] = 0.0
                 context = ""
                 context_docs = []
             else:
                 logger.info("查询为专业咨询，执行 RAG 流程")
-                retrieval_strategy = self.strategy_selector.select_strategy(query)  # 根据用户的query选择检索策略
-                # 根据检索策略，返回检索上下文
-                retrieval_start = time.time()
-                context_docs = self.retrieve_and_merge(
-                    query, source_filter=source_filter, strategy=retrieval_strategy
-                )
-                self.last_query_result["retrieval_time"] = time.time() - retrieval_start
-                # 上下文分流：表格块在概览型 query 下用 [表格] 语义摘要（LLM 易读），
-                # 精确数字型 query 或非表格块用父块原文（保证精确数字可查）
-                is_precise = self._is_precise_query(query)
-                context_parts = []
-                for doc in context_docs:
-                    summaries = doc.metadata.get("table_summaries")
-                    if summaries and not is_precise:
-                        context_parts.append("\n".join(summaries))
-                    else:
-                        context_parts.append(doc.page_content)
-                context = "\n\n".join(context_parts) if context_parts else ""
-                logger.info(f"构建上下文完成，包含 {len(context_docs)} 个文档块 (精确型={is_precise})")
+                # —— [5] 检索策略选择（前置判定：先判策略，再决定是否改写）——
+                # 直接检索类（规则判定，不调 LLM、不改写）：意图明确的单实体事实查询，用原 query 直接检索
+                # 非直接类（抽象/比较/指代/多实体/汇总）：先 LLM 选策略（用原 query，保留指代/多跳/抽象等
+                #   原始信号，避免改写后信号丢失），再统一改写（改写结果用于缓存与检索）
+                select_start = time.time()
+                if self._is_direct_query(query, matched_companies):
+                    retrieval_strategy = "直接检索"
+                    rewritten_query = query.strip()   # 不改写
+                    rewrite_elapsed = 0.0
+                    logger.info(f"规则判定为直接检索，跳过策略选择与改写 (查询: '{query}')")
+                else:
+                    # select_strategy 内部完成归一化（无法识别自动回退"直接检索"）
+                    retrieval_strategy = self.strategy_selector.select_strategy(query)
+                    rewritten_query, rewrite_elapsed = self._rewrite_query(query, history_context)
+                self.last_query_result["strategy_select_time"] = time.time() - select_start
+                self.last_query_result["rewritten_query"] = rewritten_query
+                self.last_query_result["rewrite_time"] = rewrite_elapsed
 
-                # 记录中间产物：上下文、来源、doc_ids
-                self.last_query_result["contexts"] = context_parts
-                self.last_query_result["retrieved_doc_ids"] = [
-                    str(doc.metadata.get("parent_id", "")) for doc in context_docs
-                ]
-                self.last_query_result["source_metas"] = [
-                    {
-                        "title": doc.metadata.get("file_name") or doc.metadata.get("name", ""),
-                        "code": doc.metadata.get("code", ""),
-                        "time": doc.metadata.get("timestamp", ""),
-                        "source": doc.metadata.get("source", ""),
-                        "name": doc.metadata.get("name", ""),
-                    }
-                    for doc in context_docs
-                ]
+                # —— [4] 第二层缓存：Redis 向量缓存（query 来源：直接类=原query；非直接类=改写后query）——
+                # 命中：跳过 混合检索 + 重排（全链路最耗时环节），复用缓存上下文，
+                #       仍走下方共用 LLM 生成（只缓存上下文，不缓存答案）
+                # 未命中：走原链路；生成成功后回填上下文到缓存
+                cache_start = time.time()
+                cache_hit_data = None
+                if self.vector_cache is not None:
+                    try:
+                        q_vec = self.vector_store.get_query_vector(rewritten_query)
+                        cache_hit_data = self.vector_cache.search_similar(q_vec, source_filter=source_filter)
+                    except Exception as e:
+                        logger.warning(f"向量缓存查询异常，跳过缓存: {e}")  # 缓存绝不阻断主流程
+                self.last_query_result["cache_time"] = time.time() - cache_start
+
+                if cache_hit_data:
+                    # —— 命中：复用缓存上下文 ——
+                    cache_hit = True
+                    context_parts = cache_hit_data["chunks"]
+                    context = "\n\n".join(context_parts) if context_parts else ""
+                    context_docs = []
+                    parent_ids = cache_hit_data["parent_ids"]
+                    self.last_query_result["contexts"] = context_parts
+                    self.last_query_result["retrieved_doc_ids"] = [str(p) for p in parent_ids]
+                    self.last_query_result["source_metas"] = cache_hit_data["source_metas"]
+                    retrieval_strategy = "cache"
+                    logger.info(f"向量缓存命中 | 级别={'formal' if cache_hit_data['is_formal'] else 'temporary'} | 复用上下文 {len(context_parts)} 块")
+                else:
+                    # —— 未命中：按已选策略检索 → 上下文组装 ——
+                    retrieval_start = time.time()
+                    context_docs = self.retrieve_and_merge(
+                        rewritten_query, source_filter=source_filter, strategy=retrieval_strategy
+                    )
+                    self.last_query_result["retrieval_time"] = time.time() - retrieval_start
+                    # 上下文分流：表格块在概览型 query 下用 [表格] 语义摘要（LLM 易读），
+                    # 精确数字型 query 或非表格块用父块原文（保证精确数字可查）。
+                    # 改写后 query 可能精简掉触发词，用 原query OR 改写query 任一命中即按精确型处理（保守优先，宁可原文不丢数字）
+                    is_precise = self._is_precise_query(query) or self._is_precise_query(rewritten_query)
+                    context_parts = []
+                    for doc in context_docs:
+                        summaries = doc.metadata.get("table_summaries")
+                        if summaries and not is_precise:
+                            context_parts.append("\n".join(summaries))
+                        else:
+                            context_parts.append(doc.page_content)
+                    context = "\n\n".join(context_parts) if context_parts else ""
+                    logger.info(f"构建上下文完成，包含 {len(context_docs)} 个文档块 (精确型={is_precise})")
+
+                    # 记录中间产物：上下文、来源、doc_ids
+                    self.last_query_result["contexts"] = context_parts
+                    parent_ids = []
+                    for doc in context_docs:
+                        pid = doc.metadata.get("parent_id")
+                        if pid:
+                            try:
+                                parent_ids.append(int(pid))
+                            except (TypeError, ValueError):
+                                parent_ids.append(pid)  # 非数字 id 原样保留
+                    self.last_query_result["retrieved_doc_ids"] = [str(p) for p in parent_ids]
+                    self.last_query_result["source_metas"] = [
+                        {
+                            "title": doc.metadata.get("file_name") or doc.metadata.get("name", ""),
+                            "code": doc.metadata.get("code", ""),
+                            "time": doc.metadata.get("timestamp", ""),
+                            "source": doc.metadata.get("source", ""),
+                            "name": doc.metadata.get("name", ""),
+                        }
+                        for doc in context_docs
+                    ]
+
+                # 统一写缓存评估字段（命中/未命中都写，避免多轮对话残留上次命中状态）
+                self.last_query_result["cache_hit"] = cache_hit
+                self.last_query_result["cache_level"] = (
+                    "formal" if cache_hit_data["is_formal"] else "temporary"
+                ) if cache_hit else ""
 
             self.last_query_result["retrieval_strategy"] = retrieval_strategy
 
@@ -385,6 +546,23 @@ class RAGSystem:
                 self.last_query_result["generated_answer"] = "".join(answer_parts)
                 self.last_query_result["generation_time"] = time.time() - gen_start
                 self.last_query_result["total_time"] = time.time() - start_time
+
+                # —— 缓存回填（仅未命中且生成成功；只缓存上下文，不缓存答案；失败不影响主流程）——
+                if not cache_hit and q_vec is not None and self.vector_cache is not None and context_parts:
+                    try:
+                        self.vector_cache.save_cache(
+                            query_text=query,
+                            rewritten_query=rewritten_query,
+                            query_vector=q_vec,
+                            chunks=context_parts,
+                            parent_ids=parent_ids,
+                            source_metas=self.last_query_result.get("source_metas", []),
+                            source_filter=source_filter,
+                        )
+                        logger.info(f"缓存回填完成 (query: '{query[:30]}')")
+                    except Exception as e:
+                        logger.warning(f"缓存回填失败（不影响主流程）: {e}")
+
                 logger.info(
                     f"LLM查询处理完成 (生成耗时: {self.last_query_result['generation_time']:.2f}s, "
                     f"总耗时: {self.last_query_result['total_time']:.2f}s, 查询: {query}"
@@ -415,11 +593,16 @@ class RAGSystem:
                 "retrieved_doc_ids": self.last_query_result.get("retrieved_doc_ids", []),
                 "source_metas": self.last_query_result.get("source_metas", []),
                 "retrieval_strategy": self.last_query_result.get("retrieval_strategy", ""),
+                "strategy_select_time": self.last_query_result.get("strategy_select_time", 0.0),
+                "rewritten_query": self.last_query_result.get("rewritten_query", ""),
+                "rewrite_time": self.last_query_result.get("rewrite_time", 0.0),
                 "classify_time": self.last_query_result.get("classify_time", 0.0),
                 "retrieval_time": self.last_query_result.get("retrieval_time", 0.0),
                 "generation_time": self.last_query_result.get("generation_time", 0.0),
                 "total_time": self.last_query_result.get("total_time", 0.0),
                 "cache_hit": self.last_query_result.get("cache_hit", False),
+                "cache_level": self.last_query_result.get("cache_level", ""),
+                "cache_time": self.last_query_result.get("cache_time", 0.0),
                 "matched_companies": self.last_query_result.get("matched_companies", []),
                 "eval_time": datetime.now(),
             }
