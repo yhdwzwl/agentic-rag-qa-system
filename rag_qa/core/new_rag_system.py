@@ -1,6 +1,8 @@
 ﻿from .prompts import RAGPrompts
 #   导入 time 模块，用于计算时间
 import time
+#   导入 re 模块，用于解析答案中的来源编号 [N]
+import re
 from datetime import datetime
 from base import logger, Config
 from langchain_core.documents import Document
@@ -12,6 +14,19 @@ conf = Config()
 # 精确数字型 query 触发词：命中则表格块上下文用原文（保证精确数字可查），未命中用 [表格] 摘要
 PRECISE_QUERY_WORDS = ["多少", "几", "分别", "具体", "明细", "逐项",
                        "列出", "到底", "数值", "金额是", "具体数字", "具体金额"]
+
+# —— [6] 表格类 query 触发词：命中则检索时叠加 is_table == 1 过滤（优先召回表格块）——
+# 保守原则：只收"明确问表格内容"的高置信词，宁可少判（漏判只是退回普通混合检索，
+# 语义召回仍可用），不可误判（误判会把候选限制在表格块上，文本块被排除）
+TABLE_QUERY_WORDS = [
+    "明细", "清单", "一览", "列表", "名单", "名册",
+    "前十大", "十大股东", "股东名单", "持股情况", "持股明细",
+    "质押明细", "减持明细", "增持明细", "回购明细",
+    "分红方案", "派息方案", "分红派息", "利润分配方案",
+    "募集资金使用", "募投项目", "资金使用情况",
+    "资产负债表", "利润表", "现金流量表", "财务指标",
+    "使用情况表", "表格", "什么表",
+]
 
 # —— [5] 检索策略选择：直接检索的规则判定（用户拍板：直接检索不需要策略、不需要改写）——
 # 否定信号：命中任一 → 判定为"非直接检索"（走 LLM 选策略 + 改写）
@@ -32,6 +47,21 @@ DIRECT_QUERY_FACT_WORDS = [
     "价格", "股价", "市值", "持股", "减持", "增持", "融资", "回购", "分红",
     "质押", "解禁", "收购", "中标", "业绩", "营收", "净利润", "毛利率", "负债",
     "现金流", "评级", "公告", "披露", "发布", "派息", "定增", "重组", "股数",
+]
+
+# —— [9] 拒答检测短语（起步词表，供 [10]评估/[11]自愈触发）——
+# 保守原则：只收"明确拒答/无法从资料作答"的高置信短语，宁可漏判（不触发自愈）
+# 不可误判（误触发自愈会多消耗一次 LLM 调用）；后续靠 rag_eval_results 的
+# refusal_detected 分布标定增删
+REFUSAL_PHRASES = [
+    "无法回答", "暂时无法回答", "无法回答这个问题", "无法回答您的问题",
+    "根据现有资料，暂时无法回答", "根据现有资料无法回答", "现有资料无法回答",
+    "没有找到", "未找到", "找不到", "无法找到", "未能找到", "没有查找到",
+    "没有检索到", "未检索到", "检索不到", "没有搜索到", "未搜索到",
+    "没有相关信息", "没有相关资料", "没有找到相关资料", "未查到", "查不到",
+    "无法提供", "无法给出", "无法确认", "无法判断", "无法从资料中", "无法根据资料",
+    "资料中未提及", "公告中未提及", "未提及该", "未提及相关",
+    "无法基于现有资料", "无法根据现有资料", "不能回答", "不知道",
 ]
 
 
@@ -83,17 +113,27 @@ class RAGSystem:
             "rewrite_time": 0.0,
             "cache_time": 0.0,
             "retrieval_time": 0.0,
+            "milvus_search_time": 0.0,
+            "mysql_fetch_time": 0.0,
             "rerank_time": 0.0,
+            "rerank_disabled": False,
             "generation_time": 0.0,
             "total_time": 0.0,
             "cache_hit": False,
             "cache_level": "",
             "fallback": "",
-            "matched_companies": []
+            "matched_companies": [],
+            # [8] 上下文组装评估字段（空上下文标记 + 分层截断信息，供 [10]评估/[11]自愈观测）
+            "context_empty": False,
+            "truncated_info": {},
+            # [9] 来源标注与拒答检测（LLM 成功路径按真实值填充，供前端溯源渲染与 [11] 自愈触发）
+            "citations": [],
+            "refusal_detected": False,
+            "refusal_reason": "",
         }
 
     #   定义私有方法，使用假设文档进行检索（HyDE）
-    def _retrieve_with_hyde(self, query, source_filter=None):
+    def _retrieve_with_hyde(self, query, source_filter=None, table_only=False):
         logger.info(f"使用 HyDE 策略进行检索 (查询: '{query}')")
         #   获取假设问题生成的 Prompt 模板
         hyde_prompt_template = RAGPrompts.hyde_prompt()  # 使用 template 后缀区分
@@ -105,14 +145,15 @@ class RAGSystem:
             #   使用假设答案进行检索，并返回检索结果
             #   注意：HyDE 通常只用于生成检索向量，不一定需要 rerank 这一步，但这里复用了
             return self.vector_store.hybrid_search_with_rerank(
-                hypo_answer, k=conf.RETRIEVAL_K, source_filter=source_filter  # 使用 K 而非 M
+                hypo_answer, k=conf.RETRIEVAL_K, source_filter=source_filter,  # 使用 K 而非 M
+                table_only=table_only
             )
         except Exception as e:
             logger.error(f"HyDE 策略执行失败: {e}")
             return []
 
     #   定义私有方法，使用子查询进行检索
-    def _retrieve_with_subqueries(self, query, source_filter=None):
+    def _retrieve_with_subqueries(self, query, source_filter=None, table_only=False):
         """
         1.获取提示词
         2、调用大模型得到子问题
@@ -141,7 +182,8 @@ class RAGSystem:
                 #   使用子查询进行检索，并将结果添加到列表中
                 #   这里对每个子查询都执行了 hybrid search + rerank，开销可能较大
                 docs = self.vector_store.hybrid_search_with_rerank(
-                    sub_q, k=conf.RETRIEVAL_K, source_filter=source_filter  # 使用 K
+                    sub_q, k=conf.RETRIEVAL_K, source_filter=source_filter,  # 使用 K
+                    table_only=table_only
                 )
                 all_docs.extend(docs)
                 logger.info(f"子查询 '{sub_q}' 检索到 {len(docs)} 个文档")
@@ -207,26 +249,28 @@ class RAGSystem:
         return rewritten, time.time() - rewrite_start
 
     #   定义私有方法，使用回溯问题进行检索
-    def _retrieve_with_backtracking(self, query, source_filter=None):
+    def _retrieve_with_backtracking(self, query, source_filter=None, table_only=False):
         """
         回溯问题策略：query 已在 generate_answer 入口按需改写（_rewrite_query，仅非直接检索类），
         此处直接用（已改写的）query 检索，不再二次改写（避免改变检索意图、重复消耗 LLM）。
         :param query: 已改写（或原样）的查询
         :param source_filter: 公告类型过滤，透传给 Milvus
+        :param table_only: 表格类 query 过滤，透传给 Milvus
         :return:
         """
         logger.info(f"使用回溯问题策略进行检索 (查询: '{query}')")
         try:
             # 直接用传入的（已改写的）query 执行混合检索
             return self.vector_store.hybrid_search_with_rerank(
-                query, k=conf.RETRIEVAL_K, source_filter=source_filter  # 使用 K
+                query, k=conf.RETRIEVAL_K, source_filter=source_filter,  # 使用 K
+                table_only=table_only
             )
         except Exception as e:
             logger.error(f"回溯问题策略执行失败: {e}")
             return []
 
     #   定义方法，检索并合并相关文档
-    def retrieve_and_merge(self, query, source_filter=None, strategy=None):  # 新增 strategy 参数
+    def retrieve_and_merge(self, query, source_filter=None, strategy=None, table_only=False):  # 新增 strategy 参数
         # 如果未指定检索策略，则使用策略选择器选择
         if not strategy:
             strategy = self.strategy_selector.select_strategy(query)
@@ -234,18 +278,19 @@ class RAGSystem:
         #   根据检索策略选择不同的检索方式
         ranked_sub_chunks = []  # 初始化
         if strategy == "回溯问题检索":
-            ranked_sub_chunks = self._retrieve_with_backtracking(query, source_filter=source_filter)
+            ranked_sub_chunks = self._retrieve_with_backtracking(query, source_filter=source_filter, table_only=table_only)
         elif strategy == "子查询检索":
-            ranked_sub_chunks = self._retrieve_with_subqueries(query, source_filter=source_filter)  # 返回的是唯一文档列表
+            ranked_sub_chunks = self._retrieve_with_subqueries(query, source_filter=source_filter, table_only=table_only)  # 返回的是唯一文档列表
             # 注意：子查询返回的是已 rerank 过的父文档或子块列表，后续合并逻辑可能需要调整
             # 当前实现中，子查询返回的是初步检索（可能已rerank）的块，再进行合并
         elif strategy == "假设问题检索":
-            ranked_sub_chunks = self._retrieve_with_hyde(query, source_filter=source_filter)
+            ranked_sub_chunks = self._retrieve_with_hyde(query, source_filter=source_filter, table_only=table_only)
         else:  # 默认或“直接检索”
             logger.info(f"使用直接检索策略 (查询: '{query}')")
             ranked_sub_chunks = self.vector_store.hybrid_search_with_rerank(
-                query, k=conf.RETRIEVAL_K, source_filter=source_filter
-            )  # 注意 hybrid_search_with_rerank 返回的是 rerank 后的父文档
+                query, k=conf.RETRIEVAL_K, source_filter=source_filter,  # 注意 hybrid_search_with_rerank 返回的是 rerank 后的父文档
+                table_only=table_only
+            )
 
         logger.info(f"策略 '{strategy}' 检索到 {len(ranked_sub_chunks)} 个候选文档 (可能已是父文档)")
         final_context_docs = ranked_sub_chunks[:conf.CANDIDATE_M]
@@ -257,6 +302,18 @@ class RAGSystem:
         if not query:
             return False
         return any(w in query for w in PRECISE_QUERY_WORDS)
+
+    def _is_table_query(self, query: str) -> bool:
+        """规则判定 query 是否"表格类"（问表格内容的问题）。
+
+        命中触发词 → 检索时叠加 is_table == 1 过滤（优先召回表格块，空结果自动回退）。
+        保守原则：宁可少判（漏判只是退回普通混合检索），不可误判。
+        表格类 ≠ 精确数字型：精确型控制"上下文用原文还是 [表格] 摘要"，表格类控制"召回过滤"。
+        """
+        if not query:
+            return False
+        q = query.strip().lower()
+        return any(w in q for w in TABLE_QUERY_WORDS)
 
     def _is_direct_query(self, query: str, matched_companies: list) -> bool:
         """
@@ -282,6 +339,154 @@ class RAGSystem:
         if matched_companies:
             return True
         return any(w in q_lower for w in DIRECT_QUERY_FACT_WORDS)
+
+    # —— [8] 上下文组装（父块优先）：三个独立方法，可单测、可复用（[11] 自愈可重新组装）——
+
+    def _build_context_blocks(self, context_docs, query, rewritten_query):
+        """检索结果（父块 Document 列表）→ 内容块列表 + 结构化来源列表（同序）。
+
+        表格分流：概览型 query 用 [表格] 语义摘要（LLM 易读）；精确数字型（原 query OR
+        改写 query 任一命中触发词，防改写精简掉触发词）用父块原文（保证精确数字可查）。
+        :return: (blocks, source_metas, is_precise)
+        """
+        is_precise = self._is_precise_query(query) or self._is_precise_query(rewritten_query)
+        blocks = []
+        source_metas = []
+        for doc in context_docs:
+            summaries = doc.metadata.get("table_summaries")
+            if summaries and not is_precise:
+                blocks.append("\n".join(summaries))
+            else:
+                blocks.append(doc.page_content)
+            source_metas.append({
+                "title": doc.metadata.get("file_name") or doc.metadata.get("name", ""),
+                "code": doc.metadata.get("code", ""),
+                "time": doc.metadata.get("timestamp", ""),
+                "source": doc.metadata.get("source", ""),
+                "name": doc.metadata.get("name", ""),
+            })
+        return blocks, source_metas, is_precise
+
+    def _format_context_blocks(self, blocks, source_metas):
+        """内容块 + 来源 → 编号引用上下文（用户拍板格式：块前 [1][2]… + 尾部来源列表）。
+
+        编号与来源一一对应（blocks[i] ↔ source_metas[i]），LLM 回答时可引用编号，
+        为 [9] 答案逐句标注来源提供可映射依据（数据层铺垫）。
+        来源列表放上下文尾部，随块数对齐（截断后只列保留块）。
+        """
+        if not blocks:
+            return ""
+        parts = [f"[{i}] {blk}" for i, blk in enumerate(blocks, 1)]
+        metas = source_metas or []
+        refs = []
+        for i, sm in enumerate(metas, 1):
+            title = (sm.get("title") or sm.get("name") or "").strip()
+            t = (sm.get("time") or "").strip()
+            refs.append(f"[{i}] {title}（{t}）" if t else f"[{i}] {title}")
+        if refs:
+            parts.append("来源列表：\n" + "\n".join(refs))
+        return "\n\n".join(parts)
+
+    def _truncate_layered(self, blocks, source_metas, history, question):
+        """分层截断（[8] 遗留风险①修复，基础版，用户拍板）。
+
+        优先级：question 完整保留 > history 近轮优先（从最新往前）> context 按块顺序
+        （上游已按 rerank 分数降序，按序追加即分数优先）> 来源列表（随保留块滚动预留）。
+        编号前缀（5 字符/块）与来源列表开销滚动计入预算，保证最终组装后不超 max_prompt_length。
+        :return: (kept_blocks, kept_metas, kept_history, truncated_info)
+        """
+        base_len = len(self.rag_prompt.format(context="", history="", question=""))
+        avail = self.max_prompt_length - base_len - len(question)
+        # 1) history 从最新（列表末尾）往最旧保留；轮间分隔符 1 字符（"\n"，与 history_context 构造一致）
+        kept_history = []
+        for h in reversed(history or []):
+            block = f"Q: {h['question']}\nA: {h['answer']}"
+            cost = len(block) + (1 if kept_history else 0)
+            if cost > avail:
+                break  # 预算不足：丢弃更旧轮（最近一轮都放不下则全部丢弃，宁缺毋滥）
+            kept_history.append(h)
+            avail -= cost
+        kept_history = list(reversed(kept_history))  # 恢复 最旧→最新 顺序
+        # 2) context 按块追加：编号前缀 5 字符/块 + 块间分隔 2 字符恒定预留
+        #    （"\n\n" 同时承接编号块之间、以及末块与尾部来源列表之间；最后一块的 2 由 refs 或模板前缀承接）
+        kept_blocks, kept_metas = [], []
+        refs_reserve = 0
+        metas = source_metas or []
+        for idx, blk in enumerate(blocks or []):
+            meta = metas[idx] if idx < len(metas) else {}
+            ref_line = len(f"[{idx + 1}] {(meta.get('title') or meta.get('name') or '')}（{meta.get('time') or ''}）")
+            new_refs_reserve = refs_reserve + ref_line + (len("来源列表：\n") if refs_reserve == 0 else 0)
+            cost = len(blk) + 5 + 2
+            if cost > avail - new_refs_reserve:
+                # 预算不足：首块都放不下且仍有预算时按剩余预算硬截保前部（扣编号5+块间2+refs）；
+                # 已有保留块则丢弃后续（保持块完整）
+                if not kept_blocks and (avail - new_refs_reserve) > 7:
+                    kept_blocks.append(blk[:max(0, avail - new_refs_reserve - 7)])
+                    kept_metas.append(meta)
+                break
+            kept_blocks.append(blk)
+            kept_metas.append(meta)
+            avail -= cost
+            refs_reserve = new_refs_reserve
+        truncated_info = {
+            "truncated": len(kept_blocks) < len(blocks or []) or len(kept_history) < len(history or []),
+            "history_total_rounds": len(history or []),
+            "history_kept_rounds": len(kept_history),
+            "context_blocks_before": len(blocks or []),
+            "context_blocks_after": len(kept_blocks),
+        }
+        return kept_blocks, kept_metas, kept_history, truncated_info
+
+    # —— [9] 答案生成（LLM流式）收尾：来源标注 + 拒答检测（数据层，可单测、可复用）——
+
+    def _extract_citations(self, answer, source_metas):
+        """从生成答案中解析 [N] 来源编号 → 结构化引用列表（[9] 来源标注数据层）。
+
+        编号与上下文块编号一一对应（_format_context_blocks 的 [1][2]…，source_metas 同序）。
+        - 仅接受 1..len(source_metas) 范围内的编号，越界忽略（防御模型幻觉编号）
+        - 同一编号多次出现只保留首次（按答案中出现顺序）
+        - 无编号/无来源返回空列表，绝不抛异常
+        :return: [{"index": N, "title": ..., "time": ..., "source": ..., "code": ..., "name": ...}, ...]
+        """
+        if not answer or not source_metas:
+            return []
+        seen = set()
+        citations = []
+        n = len(source_metas)
+        for m in re.finditer(r"\[(\d{1,3})\]", answer):
+            idx = int(m.group(1))
+            if idx < 1 or idx > n or idx in seen:
+                continue
+            seen.add(idx)
+            sm = source_metas[idx - 1]
+            citations.append({
+                "index": idx,
+                "title": sm.get("title") or sm.get("name") or "",
+                "time": sm.get("time") or "",
+                "source": sm.get("source") or "",
+                "code": sm.get("code") or "",
+                "name": sm.get("name") or "",
+            })
+        return citations
+
+    def _detect_refusal(self, answer, context_empty, is_general=False):
+        """拒答检测（[9]）：模型明确表示"找不到/无法回答"时置位，作为 [11] 自愈的触发入口。
+
+        信号1：上下文为空（专业咨询无检索块 → 无可依据资料，直接视为拒答场景）
+        信号2：答案文本命中拒答短语（REFUSAL_PHRASES 保守词表，起步值待标定）
+        - 通用知识分支不依赖检索，空上下文是常态，不判拒答（is_general=True 跳过信号1）
+        :return: (refusal_detected, reason)
+        """
+        if is_general:
+            # 通用知识不依赖检索，空上下文是常态，不判拒答
+            return False, ""
+        if context_empty:
+            return True, "context_empty"
+        text = (answer or "").strip()
+        for phrase in REFUSAL_PHRASES:
+            if phrase in text:
+                return True, f"phrase:{phrase}"
+        return False, ""
 
     # #   定义方法，生成答案
     # def generate_answer(self, query, source_filter=None):
@@ -384,10 +589,29 @@ class RAGSystem:
         self.last_query_result["classify_time"] = time.time() - classify_start
         self.last_query_result["query_text"] = query
         self.last_query_result["matched_companies"] = matched_companies
-        # 每次调用先复位缓存评估字段（避免多轮对话时残留上次命中状态污染评估记录）
+        # 每次调用先复位缓存/耗时评估字段（避免多轮对话时残留上次命中状态污染评估记录）
         self.last_query_result["cache_hit"] = False
         self.last_query_result["cache_level"] = ""
         self.last_query_result["cache_time"] = 0.0
+        self.last_query_result["milvus_search_time"] = 0.0
+        self.last_query_result["mysql_fetch_time"] = 0.0
+        self.last_query_result["rerank_time"] = 0.0
+        self.last_query_result["rerank_disabled"] = False
+        # 表格类判定与回退标记（每次复位；未命中检索时按真实值填充，缓存命中保持默认）
+        self.last_query_result["table_only"] = False
+        self.last_query_result["table_fallback"] = False
+        self.last_query_result["table_hit_count"] = 0
+        self.last_query_result["fallback_to_mysql"] = False
+        # [8] 上下文组装评估字段（每次复位；检索/缓存路径按真实值填充）
+        self.last_query_result["context_empty"] = False
+        self.last_query_result["truncated_info"] = {
+            "truncated": False, "history_total_rounds": 0, "history_kept_rounds": 0,
+            "context_blocks_before": 0, "context_blocks_after": 0
+        }
+        # [9] 来源标注与拒答检测（每次复位；LLM 成功路径按真实值填充，失败/异常保持默认）
+        self.last_query_result["citations"] = []
+        self.last_query_result["refusal_detected"] = False
+        self.last_query_result["refusal_reason"] = ""
         logger.info(f"查询分类结果: {query_category} (查询: '{query}', 命中公司: {matched_companies})")
 
         # 准备上下文
@@ -398,13 +622,13 @@ class RAGSystem:
             q_vec = None
             context_parts = []
             parent_ids = []
+            source_metas = []
             rewritten_query = ""
             if query_category in ("通用知识", "通用无关"):
                 logger.info("查询为通用知识，直接调用 LLM")
                 # 不进入检索链路，无需改写；评估字段置为原 query、耗时 0
                 self.last_query_result["rewritten_query"] = query
                 self.last_query_result["rewrite_time"] = 0.0
-                context = ""
                 context_docs = []
             else:
                 logger.info("查询为专业咨询，执行 RAG 流程")
@@ -444,37 +668,48 @@ class RAGSystem:
                     # —— 命中：复用缓存上下文 ——
                     cache_hit = True
                     context_parts = cache_hit_data["chunks"]
-                    context = "\n\n".join(context_parts) if context_parts else ""
+                    # 缓存按序对齐加来源头（用户拍板）：chunks[i] ↔ source_metas[i]
+                    # （save_cache 时两列表同序保存；老缓存缺字段用 .get 防御）
+                    source_metas = cache_hit_data.get("source_metas", [])
                     context_docs = []
                     parent_ids = cache_hit_data["parent_ids"]
-                    self.last_query_result["contexts"] = context_parts
                     self.last_query_result["retrieved_doc_ids"] = [str(p) for p in parent_ids]
-                    self.last_query_result["source_metas"] = cache_hit_data["source_metas"]
                     retrieval_strategy = "cache"
                     logger.info(f"向量缓存命中 | 级别={'formal' if cache_hit_data['is_formal'] else 'temporary'} | 复用上下文 {len(context_parts)} 块")
                 else:
                     # —— 未命中：按已选策略检索 → 上下文组装 ——
+                    # 表格类 query 判定：原 query OR 改写后 query 任一命中即叠加 is_table==1 过滤
+                    # （与精确型同样的保守原则：改写可能精简掉触发词，双判防漏）
+                    table_only = self._is_table_query(query) or self._is_table_query(rewritten_query)
+                    self.last_query_result["table_only"] = table_only
                     retrieval_start = time.time()
                     context_docs = self.retrieve_and_merge(
-                        rewritten_query, source_filter=source_filter, strategy=retrieval_strategy
+                        rewritten_query, source_filter=source_filter, strategy=retrieval_strategy,
+                        table_only=table_only
                     )
                     self.last_query_result["retrieval_time"] = time.time() - retrieval_start
-                    # 上下文分流：表格块在概览型 query 下用 [表格] 语义摘要（LLM 易读），
-                    # 精确数字型 query 或非表格块用父块原文（保证精确数字可查）。
-                    # 改写后 query 可能精简掉触发词，用 原query OR 改写query 任一命中即按精确型处理（保守优先，宁可原文不丢数字）
-                    is_precise = self._is_precise_query(query) or self._is_precise_query(rewritten_query)
-                    context_parts = []
-                    for doc in context_docs:
-                        summaries = doc.metadata.get("table_summaries")
-                        if summaries and not is_precise:
-                            context_parts.append("\n".join(summaries))
-                        else:
-                            context_parts.append(doc.page_content)
-                    context = "\n\n".join(context_parts) if context_parts else ""
+                    # 分段耗时（vector_store.last_timings 由 hybrid_search_with_rerank 填充；
+                    # 子查询/多路检索时取最后一次调用的分段值）
+                    tim = getattr(self.vector_store, "last_timings", None) or {}
+                    self.last_query_result["milvus_search_time"] = tim.get("milvus_search", 0.0)
+                    self.last_query_result["mysql_fetch_time"] = tim.get("mysql_fetch", 0.0)
+                    self.last_query_result["rerank_time"] = tim.get("rerank", 0.0)
+                    # rerank 关闭标记（配置关闭或候选不足未执行 CrossEncoder）
+                    self.last_query_result["rerank_disabled"] = tim.get("rerank_disabled", False)
+                    # 表格过滤回退标记 + 表格命中数（供 rag_eval_results 标定 TABLE_QUERY_WORDS）
+                    self.last_query_result["table_fallback"] = tim.get("table_filter_fallback", False)
+                    self.last_query_result["table_hit_count"] = tim.get("table_hit_count", 0)
+                    # Milvus 异常时降级 MySQL 检索的标记（可观测 Milvus 故障频率）
+                    self.last_query_result["fallback_to_mysql"] = tim.get("fallback_to_mysql", False)
+                    # —— [8] 上下文组装（父块优先）——
+                    # 表格分流：概览型 query 用 [表格] 语义摘要（LLM 易读）；精确数字型（原 query OR
+                    # 改写 query 任一命中触发词，防改写精简掉触发词）用父块原文（保证精确数字可查）。
+                    # 编号引用 + 来源列表在下方统一组装段生成（与缓存命中路径格式一致）
+                    context_parts, source_metas, is_precise = self._build_context_blocks(
+                        context_docs, query, rewritten_query)
                     logger.info(f"构建上下文完成，包含 {len(context_docs)} 个文档块 (精确型={is_precise})")
 
-                    # 记录中间产物：上下文、来源、doc_ids
-                    self.last_query_result["contexts"] = context_parts
+                    # 记录中间产物：上下文块、来源、doc_ids
                     parent_ids = []
                     for doc in context_docs:
                         pid = doc.metadata.get("parent_id")
@@ -484,15 +719,9 @@ class RAGSystem:
                             except (TypeError, ValueError):
                                 parent_ids.append(pid)  # 非数字 id 原样保留
                     self.last_query_result["retrieved_doc_ids"] = [str(p) for p in parent_ids]
-                    self.last_query_result["source_metas"] = [
-                        {
-                            "title": doc.metadata.get("file_name") or doc.metadata.get("name", ""),
-                            "code": doc.metadata.get("code", ""),
-                            "time": doc.metadata.get("timestamp", ""),
-                            "source": doc.metadata.get("source", ""),
-                            "name": doc.metadata.get("name", ""),
-                        }
-                        for doc in context_docs
+                    # rerank 分数（评估闭环：分数分布是阈值标定的输入；缓存命中保持空）
+                    self.last_query_result["retrieved_scores"] = [
+                        doc.metadata.get("rerank_score") for doc in context_docs
                     ]
 
                 # 统一写缓存评估字段（命中/未命中都写，避免多轮对话残留上次命中状态）
@@ -503,6 +732,23 @@ class RAGSystem:
 
             self.last_query_result["retrieval_strategy"] = retrieval_strategy
 
+            # —— [8] 上下文组装：分层截断（question 完整 > history 近轮优先 > context 按块 > 来源列表）
+            # 所有分支统一走这里（通用知识/缓存命中/检索未命中），编号引用格式一致
+            context_parts_final, source_metas_final, history_final, truncated_info = self._truncate_layered(
+                context_parts, source_metas, history or [], query)
+            context = self._format_context_blocks(context_parts_final, source_metas_final)
+            history_context = "\n".join(
+                [f"Q: {h['question']}\nA: {h['answer']}" for h in history_final])
+            # 评估字段同步为实际进入 prompt 的内容（一致性：截断后只记保留块）
+            self.last_query_result["context_empty"] = not context_parts_final
+            self.last_query_result["truncated_info"] = truncated_info
+            self.last_query_result["contexts"] = context_parts_final
+            self.last_query_result["source_metas"] = source_metas_final
+            self.last_query_result["retrieved_doc_ids"] = (
+                self.last_query_result.get("retrieved_doc_ids") or [])[:len(context_parts_final)]
+            self.last_query_result["retrieved_scores"] = (
+                self.last_query_result.get("retrieved_scores") or [])[:len(context_parts_final)]
+
             # 构造提示
             prompt_input = self.rag_prompt.format(
                 context=context,
@@ -511,10 +757,9 @@ class RAGSystem:
             )
             self.last_query_result["full_prompt"] = prompt_input
 
-            # 截断提示（若超长）
+            # 兜底截断：正常路径已由分层截断保证不超长；仅当 question 本身异常超长时触发硬截
             if len(prompt_input) > self.max_prompt_length:
-                logger.warning(f"提示长度 {len(prompt_input)} 超过 {self.max_prompt_length}，进行截断")
-                # 保留问题和近期历史，截断上下文或早期历史
+                logger.warning(f"提示长度 {len(prompt_input)} 超过 {self.max_prompt_length}，兜底硬截")
                 prompt_input = prompt_input[:self.max_prompt_length]
                 logger.info(f"截断后提示长度: {len(prompt_input)}")
 
@@ -547,14 +792,34 @@ class RAGSystem:
                 self.last_query_result["generation_time"] = time.time() - gen_start
                 self.last_query_result["total_time"] = time.time() - start_time
 
+                # —— [9] 来源标注 + 拒答检测（数据层；前端可点击溯源 + [11] 自愈触发入口）——
+                # 来源标注：解析答案中的 [N] 编号 → 结构化引用（编号↔标题/时间/来源/代码），
+                # 供前端后续渲染可点击溯源；模型未引用编号时为空列表，不报错不阻断
+                self.last_query_result["citations"] = self._extract_citations(
+                    self.last_query_result["generated_answer"],
+                    self.last_query_result.get("source_metas", []))
+                # 拒答检测：上下文为空 或 答案命中拒答短语 → 标记，供 [10]评估/[11]自愈触发
+                # （通用知识分支不判拒答——不依赖检索，空上下文是常态）
+                refusal_detected, refusal_reason = self._detect_refusal(
+                    self.last_query_result["generated_answer"],
+                    self.last_query_result.get("context_empty", False),
+                    is_general=query_category in ("通用知识", "通用无关"))
+                self.last_query_result["refusal_detected"] = refusal_detected
+                self.last_query_result["refusal_reason"] = refusal_reason
+                if refusal_detected:
+                    logger.warning(
+                        f"拒答检测触发: reason={refusal_reason} (query: '{query[:30]}', "
+                        f"context_empty={self.last_query_result.get('context_empty', False)})")
+
                 # —— 缓存回填（仅未命中且生成成功；只缓存上下文，不缓存答案；失败不影响主流程）——
-                if not cache_hit and q_vec is not None and self.vector_cache is not None and context_parts:
+                # 存截断后的块（context_parts_final），避免缓存超长块下次命中仍要重复截断
+                if not cache_hit and q_vec is not None and self.vector_cache is not None and context_parts_final:
                     try:
                         self.vector_cache.save_cache(
                             query_text=query,
                             rewritten_query=rewritten_query,
                             query_vector=q_vec,
-                            chunks=context_parts,
+                            chunks=context_parts_final,
                             parent_ids=parent_ids,
                             source_metas=self.last_query_result.get("source_metas", []),
                             source_filter=source_filter,
@@ -598,12 +863,28 @@ class RAGSystem:
                 "rewrite_time": self.last_query_result.get("rewrite_time", 0.0),
                 "classify_time": self.last_query_result.get("classify_time", 0.0),
                 "retrieval_time": self.last_query_result.get("retrieval_time", 0.0),
+                "milvus_search_time": self.last_query_result.get("milvus_search_time", 0.0),
+                "mysql_fetch_time": self.last_query_result.get("mysql_fetch_time", 0.0),
+                "rerank_time": self.last_query_result.get("rerank_time", 0.0),
+                "rerank_disabled": self.last_query_result.get("rerank_disabled", False),
+                "retrieved_scores": self.last_query_result.get("retrieved_scores", []),
+                "table_only": self.last_query_result.get("table_only", False),
+                "table_fallback": self.last_query_result.get("table_fallback", False),
+                "table_hit_count": self.last_query_result.get("table_hit_count", 0),
+                "fallback_to_mysql": self.last_query_result.get("fallback_to_mysql", False),
                 "generation_time": self.last_query_result.get("generation_time", 0.0),
                 "total_time": self.last_query_result.get("total_time", 0.0),
                 "cache_hit": self.last_query_result.get("cache_hit", False),
                 "cache_level": self.last_query_result.get("cache_level", ""),
                 "cache_time": self.last_query_result.get("cache_time", 0.0),
                 "matched_companies": self.last_query_result.get("matched_companies", []),
+                # [8] 上下文组装评估字段（空上下文标记 + 分层截断信息，供 [10]评估/[11]自愈观测）
+                "context_empty": self.last_query_result.get("context_empty", False),
+                "truncated_info": self.last_query_result.get("truncated_info", {}),
+                # [9] 来源标注与拒答检测（结构化引用列表 + 拒答标记，供前端溯源与 [11] 自愈触发）
+                "citations": self.last_query_result.get("citations", []),
+                "refusal_detected": self.last_query_result.get("refusal_detected", False),
+                "refusal_reason": self.last_query_result.get("refusal_reason", ""),
                 "eval_time": datetime.now(),
             }
             col.insert_one(doc)
