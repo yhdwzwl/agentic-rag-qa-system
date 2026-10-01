@@ -82,6 +82,12 @@ class Config:
         self.CHUNK_OVERLAP = self.config.getint('retrieval', 'chunk_overlap', fallback=50)
         # 妫€绱㈣繑鍥炴暟閲?
         self.RETRIEVAL_K = self.config.getint('retrieval', 'retrieval_k', fallback=5)
+        # rerank 后保留数量（rerank_k；原 config.ini 已有此键但代码未读，本次接线；默认3）
+        self.RERANK_K = self.config.getint('retrieval', 'rerank_k', fallback=3)
+        # rerank 总开关（false=跳过 CrossEncoder，按召回顺序取 RERANK_K 个）
+        self.RERANK_ENABLED = self.config.getboolean('retrieval', 'rerank_enabled', fallback=True)
+        # 低置信度保护阈值（0=关闭；>0 时若 top1 rerank 分数低于该值，整批判定低置信度返回空）
+        self.RERANK_THRESHOLD = self.config.getfloat('retrieval', 'rerank_threshold', fallback=0.0)
         # 鏈€缁堝€欓€夋暟閲?
         self.CANDIDATE_M = self.config.getint('retrieval', 'candidate_m', fallback=2)
 
