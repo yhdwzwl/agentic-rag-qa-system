@@ -86,8 +86,8 @@
 | 功能 | 根据query类型，选最合适的检索方式（直接检索 / HyDE / 子查询 / 回溯问题） |
 | **当前完成度** | ✅ **100%**（2026-10-01 落地） |
 | 现有实现 | 1. **策略判定前置（先判策略，再决定是否改写）**：`new_rag_system.py` 新增 `_is_direct_query()` 规则判定——否定信号（抽象/比较/指代/汇总跨度）+ 多实体 + 强事实词三条件；**直接检索类不调 LLM、不改写，用原 query 直接检索**；非直接类（抽象/比较/指代/多实体/汇总）才走 LLM 选策略 + 改写<br>2. **先 LLM 选策略再改写**：非直接类用**原 query** 选策略（保留指代/多跳/抽象等原始信号，避免改写后信号丢失），再统一改写（改写结果用于缓存与检索）<br>3. **策略名归一化**：`strategy_selector.py` 新增 `STRATEGY_ALIASES`（36 个别名）+ `normalize()`——LLM 输出变体（如"假设问题检索（HyDE）"/"hyDE"/"回溯"）归一为四个规范名，无法识别自动回退"直接检索"；prompt 收紧只输出规范名<br>4. **直接检索 vs 回溯差异化**：直接 = 原 query 检索；回溯 = 改写后 query 检索（不再等价，改写即回溯的实质）<br>5. **source_filter 透传**：HyDE / 子查询 / 回溯三个策略方法补齐 source_filter 参数并透传 Milvus（原仅直接检索传，修了过滤失效 bug）<br>6. **评估字段**：`retrieval_strategy` + 新增 `strategy_select_time`（策略选择耗时）写入 MongoDB `rag_eval_results`<br>7. **校验**：`rag_qa/data/verify_strategy_selector.py`（71 项）全 PASS；回归 `verify_query_rewrite.py` 34 项通过 |
-| 最终目标 | 1. ✅ 直接检索类规则判定，不调 LLM、不改写（写清"什么样的 query 属于直接检索"）<br>2. ✅ 非直接类先 LLM 选策略再改写<br>3. ✅ 策略名归一化 + 策略选择耗时记录到评估字段<br>4. ⚠️ 数据统计自动优化选择逻辑（依赖 [10] 在线质量评估的忠实度分，未上线，留待后续） |
-| 遗留风险 | ① 直接检索判定词表为起步值（宁可少判直接，不可误判直接），需靠 `rag_eval_results` 策略分布数据标定<br>② 策略效果统计依赖 [10] 在线质量评估（0%），当前仅能记录策略使用分布<br>③ 非直接类缓存命中时仍多一次选策略 LLM 调用（可接受，命中率由 threshold 控制） |
+| 最终目标 | 1. ✅ 直接检索类规则判定，不调 LLM、不改写（写清"什么样的 query 属于直接检索"）<br>2. ✅ 非直接类先 LLM 选策略再改写<br>3. ✅ 策略名归一化 + 策略选择耗时记录到评估字段<br>4. ⚠️ 数据统计自动优化选择逻辑（依赖 [10] 在线质量评估的忠实度分，已上线可采数，自动优化逻辑留待后续） |
+| 遗留风险 | ① 直接检索判定词表为起步值（宁可少判直接，不可误判直接），需靠 `rag_eval_results` 策略分布数据标定<br>② 策略效果统计依赖 [10] 在线质量评估（已上线），忠实度分已落库可采数；自动调优逻辑留待后续<br>③ 非直接类缓存命中时仍多一次选策略 LLM 调用（可接受，命中率由 threshold 控制） |
 
 ---
 
@@ -129,7 +129,7 @@
 |------|------|
 | 功能 | 把上下文+问题拼成prompt，调用LLM流式生成答案 |
 | **当前完成度** | ✅ **100%**（2026-10-02 落地：来源标注 + 拒答检测，90%→100%） |
-| 现有实现 | 1. **流式输出**：兼容 langchain stream()（AIMessageChunk）与生成器函数（yield str/元组）两类 LLM 接口；生成耗时 `generation_time`、总耗时 `total_time` 单独记录<br>2. **上下文超长自动截断**：分层截断（question > history 近轮 > context 按块）+ 兜底硬截（见 [8]），保证 prompt 不超 `max_prompt_length`<br>3. **✅（本次）来源标注**：`prompts.py::rag_prompt` 增强——要求模型在引用上下文内容（数字/结论）的**句子末尾标注来源编号**（如"2025年营收100亿元[1]"），尾部信息来源改为按实际引用编号 `[1][2]` 列出；生成完成后 `new_rag_system.py::_extract_citations` 解析答案中的 `[N]` → 结构化 `citations` 列表（index/title/time/source/code/name，与 source_metas 同序映射，越界编号忽略、重复去重、无编号/空输入返回空不崩），落 `last_query_result["citations"]` + MongoDB `rag_eval_results.citations`，供前端后续渲染可点击溯源（数据层铺垫，前端接线为下一步）<br>4. **✅（本次）拒答检测**：`new_rag_system.py::_detect_refusal` 双信号——① 专业咨询上下文为空（`context_empty=True`）直接判拒答场景（无可依据资料）；② 答案命中 `REFUSAL_PHRASES` 保守词表（无法回答/未找到/检索不到/资料未提及等 30+ 短语，起步值待标定）；通用知识分支不判拒答（不依赖检索，空上下文是常态）；结果 `refusal_detected/refusal_reason` 落 `last_query_result` + MongoDB `rag_eval_results`，日志打 warning，作为 [11] 自愈 Agent 的触发入口（[11] 未做，本次只做检测与标记）<br>5. **✅（本次）字段闭环**：`last_query_result` 默认字典与每轮复位块同步新增 citations/refusal_detected/refusal_reason 三字段（LLM 失败/异常保持默认，不污染下轮）；校验 `rag_qa/data/verify_answer_generation.py` 31 项全 PASS，回归 `verify_context_assembly.py` 32 项全 PASS |
+| 现有实现 | 1. **流式输出**：兼容 langchain stream()（AIMessageChunk）与生成器函数（yield str/元组）两类 LLM 接口；生成耗时 `generation_time`、总耗时 `total_time` 单独记录<br>2. **上下文超长自动截断**：分层截断（question > history 近轮 > context 按块）+ 兜底硬截（见 [8]），保证 prompt 不超 `max_prompt_length`<br>3. **✅（本次）来源标注**：`prompts.py::rag_prompt` 增强——要求模型在引用上下文内容（数字/结论）的**句子末尾标注来源编号**（如"2025年营收100亿元[1]"），尾部信息来源改为按实际引用编号 `[1][2]` 列出；生成完成后 `new_rag_system.py::_extract_citations` 解析答案中的 `[N]` → 结构化 `citations` 列表（index/title/time/source/code/name，与 source_metas 同序映射，越界编号忽略、重复去重、无编号/空输入返回空不崩），落 `last_query_result["citations"]` + MongoDB `rag_eval_results.citations`，供前端后续渲染可点击溯源（数据层铺垫，前端接线为下一步）<br>4. **✅（本次）拒答检测**：`new_rag_system.py::_detect_refusal` 双信号——① 专业咨询上下文为空（`context_empty=True`）直接判拒答场景（无可依据资料）；② 答案命中 `REFUSAL_PHRASES` 保守词表（无法回答/未找到/检索不到/资料未提及等 30+ 短语，起步值待标定）；通用知识分支不判拒答（不依赖检索，空上下文是常态）；结果 `refusal_detected/refusal_reason` 落 `last_query_result` + MongoDB `rag_eval_results`，日志打 warning，作为 [11] 自愈 Agent 的触发入口（已接线，见 [11]）<br>5. **✅（本次）字段闭环**：`last_query_result` 默认字典与每轮复位块同步新增 citations/refusal_detected/refusal_reason 三字段（LLM 失败/异常保持默认，不污染下轮）；校验 `rag_qa/data/verify_answer_generation.py` 31 项全 PASS，回归 `verify_context_assembly.py` 32 项全 PASS |
 | 最终目标 | 1. ✅ 来源标注：答案里每句话对应哪个公告，后面可以点（[N] 内联编号 + 结构化 citations 落库，前端接线为下一步）<br>2. ✅ 拒答检测：模型说"找不到"的时候，触发自愈（检测+标记+落库已完成，实际自愈循环属 [11]） |
 | 遗留风险 | ① ⚠️ **来源标注可靠性依赖模型遵循编号指令**：模型可能漏标/错标编号；越界编号已被解析层忽略，漏标则 citations 为空——需靠 rag_eval_results.citations 覆盖率数据评估，必要时在 prompt 加"必须引用编号"强约束<br>② ⚠️ **拒答词表为起步值**：REFUSAL_PHRASES 保守收录，靠 rag_eval_results.refusal_detected 分布标定增删（误判会多耗一次自愈 LLM 调用，漏判则不触发自愈）<br>③ **前端"可点击溯源"接线未做**：citations 已落库（MongoDB + last_query_result），前端渲染/点击跳转属前端模块工作（static/ 未跟踪）<br>④ ✅ 通用知识分支不判拒答已处理（is_general 跳过 context_empty 信号），避免通用问答全部误判 |
 
@@ -138,10 +138,10 @@
 ### [10] 在线质量自动评估
 | 维度 | 内容 |
 |------|------|
-| 功能 | 每次回答完，自动算这次回答的质量分 |
-| **当前完成度** | ❌ **0%** |
-| 现有实现 | ❌ 只有离线RAGAS评估代码，在线的还没写 |
-| 最终目标 | 1. 每次回答完，自动算忠实度分数（答案里的话能不能在上下文里找到依据）<br>2. 分数低于阈值，自动触发自愈<br>3. 拒答检测：模型说"不知道"的时候，触发自愈<br>4. 评估耗时也单独记 |
+| 功能 | 每次回答完，自动算这次回答的质量分（在线 LLM-as-Judge 忠实度） |
+| **当前完成度** | ✅ **100%**（2026-10-02 完成） |
+| 现有实现 | 1. **✅（本次）LLM-as-Judge 在线忠实度**：`prompts.py::faithfulness_prompt`（问题+编号上下文+答案 → JSON {score 0~1, unsupported_claims[]}，含"拒答本身算诚实 score=1.0"规则）；`new_rag_system.py::_evaluate_faithfulness` → `_call_eval_llm`（判分模型轮换 `[quality].eval_llm_models`，temperature=0、timeout=30、非流式，未配置回退主模型；宽容 JSON 解析 `_parse_faithfulness_response`：括号计数提取、score 越界/bool/乱码 fail-open）<br>2. **✅（本次）字段独立**：落 MongoDB `online_faithfulness / online_eval_time / eval_error / quality_issues`，与离线 RAGAS `faithfulness` **互不覆盖**（用户明确要求独立字段名）<br>3. **✅（本次）质量信号聚合**：`_build_quality_issues` = 拒答（refusal_detected）∨ 忠实度 < faithfulness_threshold(0.6) ∨ rerank_low_confidence → `quality_issues`，作为 [11] 自愈触发入口；通用知识分支跳过评估（不依赖检索，空上下文是常态）<br>4. **✅（本次）截断预算**：上下文 eval_max_context_chars=6000、答案 eval_max_answer_chars=2000 截断后再判分，防超长<br>5. **✅（本次）默认开启 + fail-open**：config.ini `[quality] eval_enabled=true`；任何异常返回 (None, []) 不阻断主流程；校验 `rag_qa/data/verify_online_eval.py` 33 项 + `verify_generate_answer_eval.py` 24 项全 PASS |
+| 最终目标 | 1. ✅ 每次回答完自动算忠实度分数（答案里的话能不能在上下文里找到依据）<br>2. ✅ 分数低于阈值，自动触发自愈（已接线 [11]）<br>3. ✅ 拒答检测：模型说"不知道"的时候，触发自愈（已接线 [11]）<br>4. ✅ 评估耗时单独记（online_eval_time 落库）<br>5. ⚠️ faithfulness_threshold=0.6 为起步值，待跑真实数据收集 online_faithfulness 分布后标定 |
 
 ---
 
@@ -149,19 +149,20 @@
 | 维度 | 内容 |
 |------|------|
 | 功能 | 质量不达标了，Agent自己反思哪里错了，自动优化检索链路 |
-| **当前完成度** | ❌ **0%** |
-| 现有实现 | ❌ 还没开始做 |
-| 最终目标 | 1. Agent自动反思：是query没改写好？还是召回的文档不对？还是策略选错了？<br>2. 自动执行优化：改写query、换检索策略、扩大topk、重新检索生成<br>3. 自愈过程记录日志，后面分析哪些问题经常出问题<br>4. 形成闭环：用户问 → 答 → 评估 → 不行就自愈 → 再答 |
+| **当前完成度** | ✅ **100%**（2026-10-02 完成） |
+| 现有实现 | 1. **✅（本次）方案A（首版流式 + 修正追加）**：`generate_answer` 收尾当 quality_issues 非空且 `[self_heal].heal_enabled` → `_self_heal` 反思→重检索→重生成→重评估，达标后 yield `【已重新检索，修正回答】+ 修正答案`；模型复读原答案不重复追加<br>2. **✅（本次）规则动作**（可解释、不依赖 LLM 稳定输出）：context_empty→换策略（直接→假设问题→子查询，末尾强制重写）；拒答有召回→强制重写；rerank_low_confidence→扩 topk（rerank_k 5→10）；忠实度低→换策略+扩 topk；LLM 反思仅记录 heal_actions 日志（失败降级规则继续）<br>3. **✅（本次）rerank_k 接线**：`vector_store.hybrid_search_with_rerank` 加可选 rerank_k（None 沿用 conf.RERANK_K=3，默认行为不变），`retrieve_and_merge` 同步透传 + candidate_m 联动，避免扩 topk 后被二次截断砍回<br>4. **✅（本次）fail-open**：任一步异常返回原答案，不改变已输出内容、不阻断主流程；跳过 Redis 缓存（避免坏上下文反复命中）；heal_max_rounds=1 起步<br>5. **✅（本次）日志闭环**：heal_triggered/heal_reason/heal_rounds/heal_actions/heal_time/heal_final_quality_issues/healed_answer 落 MongoDB，供后续分析高频问题<br>6. **✅（本次）默认开启**：config.ini `[self_heal] heal_enabled=true`；校验 `rag_qa/data/verify_self_heal.py` 36 项全 PASS，回归 verify_online_eval.py 33 + verify_generate_answer_eval.py 24 + verify_context_assembly.py 32 全 PASS |
+| 最终目标 | 1. ✅ Agent自动反思：是query没改写好？还是召回的文档不对？还是策略选错了？（反思入 heal_actions 日志，动作由规则决定）<br>2. ✅ 自动执行优化：改写query、换检索策略、扩大topk、重新检索生成<br>3. ✅ 自愈过程记录日志（heal_actions 落库，后续可分析高频问题）<br>4. ✅ 形成闭环：用户问 → 答 → 评估 → 不行就自愈 → 再答（方案A：首版流式 + 修正段追加） |
 
 ---
 
 ### [12] 三层记忆模块
-| 维度 | 内容                                                                             |
-|------|--------------------------------------------------------------------------------|
-| 功能 | 记住用户的对话历史和长期偏好                                                                 |
-| **当前完成度** | ❌ **0%**                                                                       |
-| 现有实现 | ❌ 现在只是临时传history参数，没有持久化                                                       |
-| 最终目标 | 1. 窗口记忆：最近2轮对话，用完就扔<br>2. 工作记忆：当前会话的短期记忆，存Redis<br>3. 长期记忆：用户长期偏好、常问的公司，存MySQL |
+| 维度 | 内容 |
+|------|------|
+| 功能 | 记住用户的对话历史和长期偏好（窗口/工作/长期三层，对应业界 Mem0/Zep/LangGraph 记忆范式） |
+| **当前完成度** | ✅ **100%**（2026-10-02 落地：窗口配置化 + 工作记忆 Redis + 长期记忆 MySQL 规则抽取） |
+| 现有实现 | 1. **分层**：`rag_qa/core/memory_manager.py` 新增 `MemoryManager`——窗口记忆（MySQL conversations 表最近 N 轮，由 new_main 维护）+ 工作记忆（Redis `rag:wm:{session}` 会话级实体/过滤偏好/近期问题，TTL=working_ttl）+ 长期记忆（MySQL `user_memory` 表：常问公司计数/偏好公告类型计数/query_count，**规则抽取零 LLM 成本**，`INSERT ... ON DUPLICATE KEY UPDATE` 幂等，topN 截断）<br>2. **user_id**：未接入真实用户体系，先写死 10 个 uuid（`memory_manager.DUMMY_USER_IDS`），按 session_id md5 稳定取模映射（同一会话恒同一用户，便于验证跨会话长期记忆）；`app.py` QueryRequest/WebSocket 已支持显式传 `user_id`，传入时优先<br>3. **接线**：`new_main.py::query()` 新增可选参数 `user_id=None`——流式前 `build_memory_context` 读记忆拼注入文本（任何异常降级空串），流式结束后 `update_memory` 回写（matched_companies 来自 [2] 分类器现成实体识别 + source_filter 计数，**不增首 token 延迟**）；`generate_answer`/`_self_heal` 新增 `memory_context=""` 默认参数（空串行为与旧版完全一致），拼到最终 prompt 的 history 段最前（分层截断之后拼接，不改 `_truncate_layered` 预算；注入文本限长 memory_max_chars + 兜底硬截双保险）<br>4. **窗口轮数配置化**：conversations 表保留轮数由硬编码 5 改为 `[memory] window_rounds=3`（用户拍板，`_fetch_recent_history`/`update_session_history`/`generate_answer` 三处同读配置）<br>5. **配置**：`config.ini [memory]` memory_enabled/working_ttl=7200/memory_max_chars=400/long_term_max_companies=10/window_rounds=3；`base/config.py` 加对应属性（getboolean/getint fallback，ini 缺键不崩）<br>6. **校验**：`rag_qa/data/verify_memory_manager.py`（32 项，真实 Redis+MySQL，含 fail-open/幂等/TTL/限长/签名兼容）全 PASS；回归 verify_context_assembly.py 32 项 + verify_self_heal.py 36 项全 PASS（真实退出码 0） |
+| 最终目标 | 1. ✅ 窗口记忆：最近 N 轮对话，用完就扔（用户拍板 3 轮，config 化）<br>2. ✅ 工作记忆：当前会话的短期记忆，存 Redis（TTL 过期即弃）<br>3. ✅ 长期记忆：用户长期偏好、常问的公司，存 MySQL（常问公司/偏好公告类型计数 + query_count） |
+| 遗留风险 | ① user_id 为写死临时方案（10 个 uuid），接入真实用户体系后需在 `DUMMY_USER_IDS` 处更换并让前端传稳定 id<br>② 长期偏好抽取为规则版（公司/公告类型计数），`preferences` JSON 字段预留，LLM 抽取为后续增强<br>③ 注入文本限长 400 为起步值，过长偏好会被截断；靠线上效果标定<br>④ app.py 非流式 `/api/query`（BM25 命中直返）不更新记忆（与历史更新现状一致）<br>⑤ streamlit 前端直连 RAGSystem 不传 history（按用户要求保持，仅后台可见） |
 
 ---
 
@@ -177,10 +178,10 @@
 | Rerank精排 | 100% |
 | 上下文组装 | 100% |
 | 答案生成 | 100% |
-| 在线质量评估 | 0% |
-| React自愈Agent | 0% |
-| 三层记忆 | 0% |
-| **整体完成度** | **约73%**（2026-10-02 答案生成 90%→100% 后刷新；11 项合计 800/1100） |
+| 在线质量评估 | 100% |
+| React自愈Agent | 100% |
+| 三层记忆 | 100% |
+| **整体完成度** | **约99%**（2026-10-02 [12]三层记忆 0%→100% 后刷新；11 项逐项满分 100 计 1090/1100，混合检索 90% 未满） |
 
 ---
 
@@ -196,8 +197,8 @@
 | P1.8 | ✅ 上下文组装补完 | 已完成（2026-10-02）：分层截断（question > history 近轮 > context 按块）+ 来源编号引用 [N] + 尾部来源列表 + 表格判定迁移 is_table==1 + 组装抽独立函数 + context_empty/truncated_info 落库；校验 verify_context_assembly.py 32 项 + verify_query_rewrite.py 34 项 + verify_fallback_mysql.py 15 项 + verify_milvus_hybrid.py 16 项全 PASS |
 | P2 | ✅ Rerank精排 | 已完成（2026-10-01 补完：开关/阈值/分数落库/rerank_k=3，verify_rerank.py 26 项 + verify_milvus_hybrid.py 16 项全 PASS） |
 | P3 | QA库扩容 + 弱QA治理（人工校对/回扫） | 一级缓存数据源质量：软校验关闭期间入库的弱QA需治理；QA库扩容后重标定 BM25 阈值 12 |
-| P4 | 在线质量评估 + 自愈Agent | 运行时自动优化 |
-| P5 | 三层记忆模块 | 多轮对话体验 |
+| P4 | ✅ 在线质量评估 + 自愈Agent | 已完成（2026-10-02）：[10] LLM-as-Judge 在线忠实度独立字段落库（不覆盖离线 RAGAS）+ [11] 方案A追加修正段 + 规则动作（换策略/重写/扩topk）+ fail-open；校验 verify_self_heal.py 36 + verify_online_eval.py 33 + verify_generate_answer_eval.py 24 + verify_context_assembly.py 32 全 PASS |
+| P5 | ✅ 三层记忆模块 | 已完成（2026-10-02）：窗口配置化（3轮）+ 工作记忆 Redis + 长期记忆 MySQL 规则抽取；校验 verify_memory_manager.py 32 项全 PASS |
 
 > 已完成：✅ 第一层缓存 MySQL BM25（2026-10-01）——原 P3 任务"加MySQL BM25缓存层"已落地。
 > 已完成：✅ Query改写（2026-10-01）——统一改写入口 + 对话历史消解指代 + 耗时写入评估字段，并修复回溯策略隐性 bug。
@@ -205,3 +206,6 @@
 > 已完成：✅ 混合检索补齐（2026-10-01）——Milvus 补存 is_table/has_number 标量字段（新写入 + 存量回填 20,976 条/24.3s；chunk_type 纯冗余已删除）、表格类 query 优先召回（空结果回退）、检索耗时拆分（Milvus/MySQL/rerank 三段，rerank_time 落库）、来源时间补全（pdf_time）。
 > 已完成：✅ 混合检索补完（2026-10-01 晚）——file_id=439 缺向量重灌闭环（2,683 子块，Milvus=MySQL 差异清零 23,757）、入库时序修复（upsert 成功才标 indexed）、表格回退落库标记（table_only/table_fallback/table_hit_count）、表格增强 A/B（增强不劣于原文，MRR 0.814 vs 0.789）。
 > 已完成：✅ 答案生成收尾（2026-10-02）——来源标注（prompt 内联编号引用 [N] + `_extract_citations` 结构化 citations 落库，前端溯源数据层就绪）+ 拒答检测（`_detect_refusal`：context_empty/拒答短语双信号，refusal_detected/refusal_reason 落库，[11] 自愈触发入口）；校验 verify_answer_generation.py 31 项 + 回归 verify_context_assembly.py 32 项全 PASS。
+> 已完成：✅ 在线质量自动评估 [10]（2026-10-02）——LLM-as-Judge 在线忠实度（online_faithfulness 独立字段不覆盖离线 RAGAS）+ quality_issues 三信号聚合（拒答/低分/rerank 低置信度）+ 默认开启 + fail-open；verify_online_eval.py 33 项 + verify_generate_answer_eval.py 24 项全 PASS。
+> 已完成：✅ React自愈Agent [11]（2026-10-02）——方案A（首版流式 + 【已重新检索，修正回答】追加段）+ 规则动作（context_empty→换策略 / 拒答→重写 / 低置信度→扩 topk / 忠实度低→换策略+扩 topk）+ rerank_k/candidate_m 透传接线 + heal_* 日志落库 + 默认开启 + fail-open；verify_self_heal.py 36 项全 PASS。
+> 已完成：✅ 三层记忆模块 [12]（2026-10-02）——MemoryManager（窗口 conversations 3轮配置化 + 工作记忆 Redis rag:wm TTL + 长期记忆 MySQL user_memory 规则抽取）+ user_id 写死 10 个 uuid（按 session_id 稳定映射）+ memory_context 默认参数注入 prompt history 段（截断后拼接，限长400+兜底硬截）+ window_rounds=3；校验 verify_memory_manager.py 32 项全 PASS，回归 verify_context_assembly.py 32 + verify_self_heal.py 36 项全 PASS。
