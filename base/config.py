@@ -108,6 +108,33 @@ class Config:
         self.bert_intent_cls = r"F:\small_project\aiagent\ailearn\rag\Itcast_qa_system/rag_qa/models/bert_classification_output"
 
 
+        # online quality evaluation config ([10] LLM-as-Judge faithfulness)
+        self.QUALITY_EVAL_ENABLED = self.config.getboolean('quality', 'eval_enabled', fallback=False)
+        self.QUALITY_EVAL_LLM_MODELS = [m.strip() for m in
+                                        self.config.get('quality', 'eval_llm_models', fallback='').split(',') if m.strip()]
+        self.QUALITY_FAITHFULNESS_THRESHOLD = self.config.getfloat('quality', 'faithfulness_threshold', fallback=0.6)
+        self.QUALITY_EVAL_MAX_CONTEXT_CHARS = self.config.getint('quality', 'eval_max_context_chars', fallback=6000)
+        self.QUALITY_EVAL_MAX_ANSWER_CHARS = self.config.getint('quality', 'eval_max_answer_chars', fallback=2000)
+
+        # self-heal agent config ([11] runtime loop; scheme A: append-fix)
+        self.SELF_HEAL_ENABLED = self.config.getboolean('self_heal', 'heal_enabled', fallback=False)
+        self.SELF_HEAL_MAX_ROUNDS = self.config.getint('self_heal', 'heal_max_rounds', fallback=3)
+        self.SELF_HEAL_RERANK_K_LIST = [int(x) for x in
+                                        self.config.get('self_heal', 'heal_rerank_k_list', fallback='5,10').split(',')
+                                        if x.strip().isdigit()]
+
+        # 三层记忆模块配置（[12] 窗口/工作/长期记忆；fallback 保证 ini 缺键时功能可用）
+        self.MEMORY_ENABLED = self.config.getboolean('memory', 'memory_enabled', fallback=True)
+        # 工作记忆 TTL（秒）
+        self.WORKING_TTL = self.config.getint('memory', 'working_ttl', fallback=7200)
+        # 注入 prompt 的记忆文本最大字符数
+        self.MEMORY_MAX_CHARS = self.config.getint('memory', 'memory_max_chars', fallback=400)
+        # 长期记忆常问公司保留上限
+        self.LONG_TERM_MAX_COMPANIES = self.config.getint('memory', 'long_term_max_companies', fallback=10)
+        # 窗口记忆轮数（conversations 表保留最近 N 轮；原硬编码 5）
+        self.WINDOW_ROUNDS = self.config.getint('memory', 'window_rounds', fallback=3)
+
+
 if __name__ == '__main__':
     conf = Config()
     print(conf.MYSQL_HOST)

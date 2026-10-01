@@ -549,7 +549,7 @@ class VectorStore:
             logger.error(f"降级检索自身失败，返回空结果: {e}")
             return []
 
-    def hybrid_search_with_rerank(self, query, k=conf.RETRIEVAL_K, source_filter=None, table_only=False):
+    def hybrid_search_with_rerank(self, query, k=conf.RETRIEVAL_K, source_filter=None, table_only=False, rerank_k=None):
         """
         混合检索 + 重排序
         流程：
@@ -559,6 +559,8 @@ class VectorStore:
             3. MySQL 批量查父块内容
             4. 重排序返回
         分段耗时写入 self.last_timings：milvus_search / mysql_fetch / rerank / total（秒）
+        rerank_k: 精排后保留数，None 时用 conf.RERANK_K（默认 3）；
+                  [11] 自愈扩大 topk 的唯一生效入口（传更大值如 5/10），默认行为不变
         """
         # 每次调用重置分段耗时（调用方在方法返回后读取）
         self.last_timings = {"milvus_search": 0.0, "mysql_fetch": 0.0, "rerank": 0.0, "total": 0.0,
@@ -662,8 +664,9 @@ class VectorStore:
             ranked = []
         else:
             self.last_timings["rerank_low_confidence"] = False
-        # 精排后保留数量：rerank_k（默认 3；原死配置本次接线，替代原 CANDIDATE_M 截断）
-        ranked = ranked[:conf.RERANK_K]
+        # 精排后保留数量：rerank_k（默认 conf.RERANK_K=3；None 时用默认值；
+        # [11] 自愈传更大值扩大 topk，正常路径不传行为不变）
+        ranked = ranked[:rerank_k if rerank_k else conf.RERANK_K]
         self.last_timings["rerank"] = time.time() - t2
         # rerank 阶段统计（评估闭环输入，供阈值标定；rerank 关闭/候选不足时为空）
         score_list = [d.metadata["rerank_score"] for d in parent_docs
