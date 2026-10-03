@@ -956,11 +956,17 @@ class RAGSystem:
                 if new_answer and new_answer.strip():
                     best_answer = new_answer
                 # 7) 重新评估（轮内状态；显式传参避免污染 last_query_result 首版值）
+                #    拒答已明确"答不上" → 轮内同样跳过判分，由 refusal 信号判定本轮未达标继续自愈；
+                #    只有输出肯定答案才评估忠实度（2026-10-03 用户拍板）
                 context_empty = not kept_blocks
                 ref_det, ref_reason = self._detect_refusal(new_answer, context_empty, is_general=False)
                 tim = getattr(self.vector_store, "last_timings", None) or {}
                 rerank_low = tim.get("rerank_low_confidence", False)
-                score, _claims, _el = self._evaluate_faithfulness(new_answer, query, kept_blocks)
+                if ref_det:
+                    score = None
+                    logger.info(f"自愈轮 {rounds} 仍拒答，跳过在线忠实度评估")
+                else:
+                    score, _claims, _el = self._evaluate_faithfulness(new_answer, query, kept_blocks)
                 new_issues = self._build_quality_issues(
                     score, refusal_detected=ref_det, refusal_reason=ref_reason,
                     rerank_low_confidence=rerank_low)
@@ -1370,11 +1376,13 @@ class RAGSystem:
                 )
 
                 # —— [10] 在线质量自动评估（LLM-as-Judge 忠实度；fail-open 不阻断主流程）——
-                # 通用知识分支不评估（不依赖检索）；专业咨询 + 有答案才判分
+                # 通用知识分支不评估（不依赖检索）；专业咨询 + 有答案才判分；
+                # 拒答已明确"答不上" → 跳过判分（省一次 LLM 调用与超时风险），由 refusal 信号直接触发自愈；
+                # 只有输出肯定答案才评估忠实度（2026-10-03 用户拍板）
                 eval_start = time.time()
                 eval_error = ""
                 online_faithfulness = None
-                if conf.QUALITY_EVAL_ENABLED and query_category not in ("通用知识", "通用无关"):
+                if conf.QUALITY_EVAL_ENABLED and query_category not in ("通用知识", "通用无关") and not refusal_detected:
                     try:
                         online_faithfulness, _unsupported_claims, _ = self._evaluate_faithfulness(
                             self.last_query_result["generated_answer"],
@@ -1386,6 +1394,9 @@ class RAGSystem:
                     except Exception as e:
                         eval_error = f"{type(e).__name__}: {str(e)[:200]}"
                         online_faithfulness = None
+                elif refusal_detected:
+                    eval_error = "skipped:refusal_detected"
+                    logger.info(f"拒答已触发，跳过在线忠实度评估，直接走自愈 (query: '{query[:30]}')")
                 self.last_query_result["online_faithfulness"] = online_faithfulness
                 self.last_query_result["online_eval_time"] = time.time() - eval_start
                 self.last_query_result["eval_error"] = eval_error
