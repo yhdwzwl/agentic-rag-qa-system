@@ -25,8 +25,8 @@ MODEL_VERSION = "v1.0"
 EVAL_COUNT = 10
 # 是否全量重跑（True：不管之前跑过什么，全部重跑；False：只跑没跑过这个版本的）
 FORCE_RERUN = False
-# RAGAS评估用的模型
-RAGAS_LLM_MODEL = "qwen-max"
+# RAGAS评估用的模型（2026-10-03：不再写死；import conf 后从 config.ini [llm] table_llm_models 读取）
+RAGAS_LLM_MODEL = None
 RAGAS_EMBEDDING_MODEL = "text-embedding-v3"
 # ============================
 
@@ -42,6 +42,8 @@ from datasets import Dataset
 from langchain_community.chat_models import ChatTongyi
 from langchain_community.embeddings import DashScopeEmbeddings
 from base.config import conf
+# 从 config.ini 读取 RAGAS 判分模型（table_llm_models 优先，未配置回退主模型；不写死）
+RAGAS_LLM_MODEL = (conf.TABLE_LLM_MODELS or [conf.LLM_MODEL] or ["qwen-max"])[0]
 
 # 连接MongoDB
 mongo_client = MongoClient("mongodb://localhost:27017/")
@@ -67,8 +69,8 @@ def init_rag_system():
 
     llm = ChatOpenAI(
         model=conf.LLM_MODEL,
-        api_key=conf.LLM_API_KEY,
-        base_url=conf.LLM_BASE_URL,
+        api_key=conf.DASHSCOPE_API_KEY,
+        base_url=conf.DASHSCOPE_BASE_URL,
     )
 
     rag_system = RAGSystem(vs, llm)
@@ -237,10 +239,10 @@ def main():
     # 配置RAGAS模型
     llm = ChatTongyi(
         model=RAGAS_LLM_MODEL,
-        api_key=conf.LLM_API_KEY,
+        api_key=conf.DASHSCOPE_API_KEY,
     )
     embeddings = DashScopeEmbeddings(
-        dashscope_api_key=conf.LLM_API_KEY,
+        dashscope_api_key=conf.DASHSCOPE_API_KEY,
         model=RAGAS_EMBEDDING_MODEL,
     )
 

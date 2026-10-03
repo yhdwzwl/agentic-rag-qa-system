@@ -162,7 +162,8 @@ class MemoryManager:
         任何异常只记日志，不影响主流程。
         :param session_key: 会话 id（工作记忆按会话维度）
         :param user_id: 用户 id（长期记忆按用户维度；None 时按 session_id 稳定映射到写死列表）
-        :param matched_companies: 分类器输出的公司实体列表 [{code,name},...]，规则抽取的输入
+        :param matched_companies: 分类器输出的公司实体（兼容两种形态：
+            str 列表 ['宁德时代']（query_classifier 实际返回）或 dict 列表 [{code,name},...]）
         :param source_filter: 公告类型过滤（偏好统计输入）
         """
         if not self.enabled:
@@ -175,14 +176,21 @@ class MemoryManager:
         # —— 工作记忆（Redis，会话级，TTL）——
         try:
             wm = self._get_working(session_key) or {}
-            entity_map = {e.get("code"): e for e in (wm.get("entities") or []) if e.get("code")}
+            entity_map = {e.get("code") or e.get("name"): e
+                          for e in (wm.get("entities") or [])
+                          if isinstance(e, dict) and (e.get("code") or e.get("name"))}
             for c in (matched_companies or []):
-                code = str(c.get("code") or "")
-                if not code:
+                if isinstance(c, dict):
+                    code = str(c.get("code") or "")
+                    name = str(c.get("name") or "")
+                else:
+                    code, name = "", str(c or "")
+                key = code or name
+                if not key:
                     continue
-                prev = entity_map.get(code, {})
-                entity_map[code] = {"code": code,
-                                    "name": c.get("name") or prev.get("name", "")}
+                prev = entity_map.get(key, {})
+                entity_map[key] = {"code": code,
+                                   "name": name or prev.get("name", "")}
             recent = (wm.get("recent_questions") or [])
             if question:
                 recent.append(str(question)[:200])
@@ -218,19 +226,28 @@ class MemoryManager:
             row = self._get_long_term(user_id) or {}
             merged_companies = {}
             for c in (row.get("companies") or []):
-                code = str(c.get("code") or "")
-                if not code:
+                if not isinstance(c, dict):
                     continue
-                merged_companies[code] = {"code": code, "name": c.get("name", ""),
-                                          "count": int(c.get("count") or 0)}
+                code = str(c.get("code") or "")
+                name = str(c.get("name") or "")
+                key = code or name
+                if not key:
+                    continue
+                merged_companies[key] = {"code": code, "name": name,
+                                         "count": int(c.get("count") or 0)}
             for c in (companies or []):
-                code = str(c.get("code") or "")
-                if not code:
+                if isinstance(c, dict):
+                    code = str(c.get("code") or "")
+                    name = str(c.get("name") or "")
+                else:
+                    code, name = "", str(c or "")
+                key = code or name
+                if not key:
                     continue
-                prev = merged_companies.get(code, {"code": code, "name": "", "count": 0})
-                prev["name"] = c.get("name") or prev.get("name") or ""
+                prev = merged_companies.get(key, {"code": code, "name": "", "count": 0})
+                prev["name"] = name or prev.get("name") or ""
                 prev["count"] = int(prev.get("count") or 0) + 1
-                merged_companies[code] = prev
+                merged_companies[key] = prev
             top_companies = sorted(merged_companies.values(),
                                    key=lambda x: -int(x.get("count") or 0))[:self.long_term_max_companies]
 
@@ -284,7 +301,7 @@ class MemoryManager:
                 if cs:
                     parts.append("（用户长期关注）常问公司：" + "、".join(
                         f"{c.get('name','')}({c.get('code','')})×{c.get('count',0)}"
-                        for c in cs[:5]))
+                        for c in cs[:5] if isinstance(c, dict)))
                 sfs = lt.get("source_filters") or []
                 if sfs:
                     parts.append("偏好公告：" + "、".join(

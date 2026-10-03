@@ -18,6 +18,13 @@ from langchain_community.embeddings import DashScopeEmbeddings
 # 导入json库，用于加载JSON格式的评估数据集
 import json
 import os
+# [统一模型调用] 2026-10-03：评估模型不再写死，从 config.ini [llm] table_llm_models 读取
+import sys
+ROOT = r"F:\small_project\aiagent\ailearn\rag\Itcast_qa_system"
+if ROOT not in sys.path:
+    sys.path.insert(0, ROOT)
+from base.config import Config as _RagasConfig
+_RAGAS_CONF = _RagasConfig()
 
 # 1. 加载生成的数据集
 # 使用with语句打开JSON文件，确保文件正确关闭，指定编码为utf-8
@@ -50,7 +57,10 @@ dataset = Dataset.from_dict(eval_data)
 # 初始化OpenAI嵌入模型，用于计算语义相似度，设置API密钥
 # embeddings = OpenAIEmbeddings(openai_api_key=os.environ['OPENAI_API_KEY'])
 
-llm = ChatTongyi(model="qwen-max", api_key=os.getenv("API_KEY"))
+llm = ChatTongyi(
+    model=(_RAGAS_CONF.TABLE_LLM_MODELS or [_RAGAS_CONF.LLM_MODEL] or ["qwen-max"])[0],
+    api_key=os.getenv("API_KEY"),
+)
 embeddings = DashScopeEmbeddings(dashscope_api_key=os.getenv("API_KEY"), model="text-embedding-v3")
 # 4. 执行评估
 # 调用evaluate函数，传入数据集、评估指标、LLM模型和嵌入模型

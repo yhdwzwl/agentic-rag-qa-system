@@ -4,6 +4,9 @@ from langchain.prompts import PromptTemplate
 from base import logger, Config
 # 导入 OpenAI
 from openai import OpenAI
+# [统一模型调用] 策略选择 LLM 轮换：模型列表来自 config.ini [llm] table_llm_models，
+# 额度耗尽自动切换下一个模型（2026-10-03 接入 llm_router）
+from rag_qa.core import llm_router
 # 导入 re，用于策略名清洗（去标点/空白后做归一化匹配）
 import re
 
@@ -61,19 +64,11 @@ class StrategySelector:
         self.strategy_prompt_template = self._get_strategy_prompt()
 
     def call_dashscope(self, prompt):
-        # 调用 DashScope API
+        # 调用 DashScope API（[统一模型调用] table_llm_models 轮换，额度耗尽自动切下一个；
+        # temperature=0.1 保证策略输出稳定；全部失败回退"直接检索"，不阻断主流程）
         try:
-            # 创建聊天完成请求
-            completion = self.client.chat.completions.create(
-                model=Config().LLM_MODEL,
-                messages=[
-                    {"role": "system", "content": "你是一个有用的助手。"},
-                    {"role": "user", "content": prompt}
-                ],
-                temperature=0.1
-            )
-            # 返回完成结果
-            return completion.choices[0].message.content if completion.choices else "直接检索"
+            return "".join(llm_router.stream_generate(
+                Config(), prompt, temperature=0.1))
         except Exception as e:
             # 记录 API 调用失败
             logger.error(f"DashScope API 调用失败: {e}")
